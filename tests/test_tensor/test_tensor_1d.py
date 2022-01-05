@@ -5,10 +5,10 @@ from numpy.testing import assert_allclose
 
 import quimb as qu
 from quimb.tensor import (
-    MatrixProductState, MatrixProductOperator, align_TN_1D, MPS_rand_state,
-    MPO_identity, MPO_identity_like, MPO_zeros, MPO_zeros_like, MPO_rand,
-    MPO_rand_herm, MPO_ham_heis, MPS_neel_state, MPS_zero_state, bonds,
-    MPS_computational_state, Dense1D)
+    MatrixProductState, MatrixProductOperator, tensor_network_align,
+    MPS_rand_state, MPO_identity, MPO_identity_like, MPO_zeros, MPO_zeros_like,
+    MPO_rand, MPO_rand_herm, MPO_ham_heis, MPS_neel_state, MPS_zero_state,
+    bonds, MPS_computational_state, Dense1D)
 from quimb.tensor.tensor_core import oset
 
 
@@ -620,6 +620,17 @@ class TestMatrixProductState:
         mps = MPS_computational_state('010101')
         assert mps.measure_(3, get='outcome') == 1
 
+    def test_permute_arrays(self):
+        mps = MPS_rand_state(7, 5)
+        k0 = mps.to_dense()
+        mps.canonize(3)
+        mps.permute_arrays('prl')
+        assert mps[0].shape == (2, 2)
+        assert mps[1].shape == (2, 4, 2)
+        assert mps[2].shape == (2, 5, 4)
+        kf = mps.to_dense()
+        assert qu.fidelity(k0, kf) == pytest.approx(1.0)
+
 
 class TestMatrixProductOperator:
 
@@ -714,7 +725,7 @@ class TestMatrixProductOperator:
         b = MPS_rand_state(13, 7)
         o1 = k @ b
         i = MPO_identity(13)
-        k, i, b = align_TN_1D(k, i, b)
+        k, i, b = tensor_network_align(k, i, b)
         o2 = (k & i & b) ^ ...
         assert_allclose(o1, o2)
 
@@ -791,6 +802,14 @@ class TestMatrixProductOperator:
         Ad, xd, yd = A.to_dense(), x.to_dense(), y.to_dense()
         assert_allclose(Ad @ xd, yd)
 
+    def test_permute_arrays(self):
+        mpo = MPO_rand(4, 3)
+        A0 = mpo.to_dense()
+        mpo.permute_arrays('drul')
+        assert mpo[0].shape == (2, 3, 2)
+        assert mpo[1].shape == (2, 3, 2, 3)
+        Af = mpo.to_dense()
+        assert_allclose(A0, Af)
 
 # --------------------------------------------------------------------------- #
 #                         Test specific 1D instances                          #

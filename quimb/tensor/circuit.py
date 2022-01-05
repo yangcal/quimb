@@ -1,13 +1,16 @@
+import re
 import math
 import numbers
+import operator
 import functools
+import itertools
 
 import numpy as np
 from autoray import do, reshape
 
 import quimb as qu
 from ..utils import progbar as _progbar
-from ..utils import oset, partitionby, concatv, partition_all, ensure_dict
+from ..utils import oset, partitionby, concatv, partition_all, ensure_dict, LRU
 from .tensor_core import (get_tags, tags_to_oset, oset_union, tensor_contract,
                           PTensor, Tensor, TensorNetwork, rand_uuid)
 from .tensor_gen import MPS_computational_state
@@ -142,7 +145,7 @@ def rx_gate_param_gen(params):
     s = do('complex', s_re, s_im)
 
     data = [[c, s], [s, c]]
-    return do('array', data, like=params)
+    return ops.asarray(data)
 
 
 def apply_Rx(psi, theta, i, parametrize=False, **gate_opts):
@@ -150,7 +153,7 @@ def apply_Rx(psi, theta, i, parametrize=False, **gate_opts):
     """
     mtags = _merge_tags('RX', gate_opts)
     if parametrize:
-        G = ops.PArray(rx_gate_param_gen, (float(theta),))
+        G = ops.PArray(rx_gate_param_gen, (theta,))
     else:
         G = qu.Rx(float(theta))
     psi.gate_(G, int(i), tags=mtags, **gate_opts)
@@ -168,7 +171,7 @@ def ry_gate_param_gen(params):
     s = do('complex', s_re, s_im)
 
     data = [[c, -s], [s, c]]
-    return do('array', data, like=params)
+    return ops.asarray(data)
 
 
 def apply_Ry(psi, theta, i, parametrize=False, **gate_opts):
@@ -176,7 +179,7 @@ def apply_Ry(psi, theta, i, parametrize=False, **gate_opts):
     """
     mtags = _merge_tags('RY', gate_opts)
     if parametrize:
-        G = ops.PArray(ry_gate_param_gen, (float(theta),))
+        G = ops.PArray(ry_gate_param_gen, (theta,))
     else:
         G = qu.Ry(float(theta))
     psi.gate_(G, int(i), tags=mtags, **gate_opts)
@@ -194,7 +197,7 @@ def rz_gate_param_gen(params):
     s = do('complex', s_re, s_im)
 
     data = [[c + s, 0], [0, c - s]]
-    return do('array', data, like=params)
+    return ops.asarray(data)
 
 
 def apply_Rz(psi, theta, i, parametrize=False, **gate_opts):
@@ -202,7 +205,7 @@ def apply_Rz(psi, theta, i, parametrize=False, **gate_opts):
     """
     mtags = _merge_tags('RZ', gate_opts)
     if parametrize:
-        G = ops.PArray(rz_gate_param_gen, (float(theta),))
+        G = ops.PArray(rz_gate_param_gen, (theta,))
     else:
         G = qu.Rz(float(theta))
     psi.gate_(G, int(i), tags=mtags, **gate_opts)
@@ -233,7 +236,7 @@ def u3_gate_param_gen(params):
 
     data = [[c2, -el * s2],
             [ep * s2, elp * c2]]
-    return do('array', data, like=params)
+    return ops.asarray(data)
 
 
 def apply_U3(psi, theta, phi, lamda, i, parametrize=False, **gate_opts):
@@ -264,7 +267,7 @@ def u2_gate_param_gen(params):
 
     data = [[c00, c01],
             [c10, c11]]
-    return do('array', data, like=params) / 2**0.5
+    return ops.asarray(data) / 2**0.5
 
 
 def apply_U2(psi, phi, lamda, i, parametrize=False, **gate_opts):
@@ -285,7 +288,7 @@ def u1_gate_param_gen(params):
 
     data = [[1, 0],
             [0, c11]]
-    return do('array', data, like=params)
+    return ops.asarray(data)
 
 
 def apply_U1(psi, lamda, i, parametrize=False, **gate_opts):
@@ -305,7 +308,7 @@ def cu3_param_gen(params):
             [[[0, 0], [U3[0, 0], U3[0, 1]]],
              [[0, 0], [U3[1, 0], U3[1, 1]]]]]
 
-    return do('array', data, like=params)
+    return ops.asarray(data)
 
 
 @functools.lru_cache(maxsize=128)
@@ -330,7 +333,7 @@ def cu2_param_gen(params):
             [[[0, 0], [U2[0, 0], U2[0, 1]]],
              [[0, 0], [U2[1, 0], U2[1, 1]]]]]
 
-    return do('array', data, like=params)
+    return ops.asarray(data)
 
 
 @functools.lru_cache(maxsize=128)
@@ -359,7 +362,7 @@ def cu1_param_gen(params):
             [[[0, 0], [1, 0]],
              [[0, 0], [0, c11]]]]
 
-    return do('array', data, like=params)
+    return ops.asarray(data)
 
 
 @functools.lru_cache(maxsize=128)
@@ -396,7 +399,7 @@ def fsim_param_gen(params):
             [[[0, b], [a, 0]],
              [[0, 0], [0, c]]]]
 
-    return do('array', data, like=params)
+    return ops.asarray(data)
 
 
 def apply_fsim(psi, theta, phi, i, j, parametrize=False, **gate_opts):
@@ -458,7 +461,7 @@ def fsimg_param_gen(params):
             [[[0, a12 * e12 * img], [a22 * e22, 0]],
              [[0, 0], [0, c]]]]
 
-    return do('array', data, like=params)
+    return ops.asarray(data)
 
 
 def apply_fsimg(
@@ -486,7 +489,7 @@ def rzz_param_gen(params):
             [[[0, 0], [c10, 0]],
              [[0, 0], [0, c11]]]]
 
-    return do('array', data, like=params)
+    return ops.asarray(data)
 
 
 @functools.lru_cache(maxsize=128)
@@ -505,7 +508,7 @@ def rzz(gamma):
 def apply_rzz(psi, gamma, i, j, parametrize=False, **gate_opts):
     mtags = _merge_tags('RZZ', gate_opts)
     if parametrize:
-        G = ops.PArray(rzz_param_gen, (float(gamma),))
+        G = ops.PArray(rzz_param_gen, (gamma,))
     else:
         G = rzz(float(gamma))
     psi.gate_(G, (int(i), int(j)), tags=mtags, **gate_opts)
@@ -804,6 +807,21 @@ class Circuit:
         qc.apply_gates(info['gates'])
         return qc
 
+    def apply_gate_raw(self, U, where, tags=None,
+                       gate_round=None, **gate_opts):
+        """Apply the raw array ``U`` as a gate on qubits in ``where``. It will
+        be assumed to be unitary for the sake of computing reverse lightcones.
+        """
+        tags = (
+            tags_to_oset(tags) |
+            tags_to_oset(f'GATE_{len(self.gates)}')
+        )
+        if (gate_round is not None):
+            tags.add(f'ROUND_{gate_round}')
+        opts = {**self.gate_opts, **gate_opts}
+        self._psi.gate_(U, where, tags=tags, **opts)
+        self.gates.append((id(U), *where))
+
     def apply_gate(self, gate_id, *gate_args, gate_round=None, **gate_opts):
         """Apply a single gate to this tensor network quantum circuit. If
         ``gate_round`` is supplied the tensor(s) added will be tagged with
@@ -1021,24 +1039,29 @@ class Circuit:
         psi.astype_(psi.dtype)
         return psi
 
-    @property
-    def uni(self):
+    def get_uni(self, transposed=False):
         """Tensor network representation of the unitary operator (i.e. with
         the initial state removed).
         """
         U = self.psi
 
-        # rename the initial state rand_uuid bonds to 1D site inds
-        ixmap = {self.ket_site_ind(i): self.bra_site_ind(i)
-                 for i in range(self.N)}
+        if transposed:
+            # rename the initial state rand_uuid bonds to 1D site inds
+            ixmap = {self.ket_site_ind(i): self.bra_site_ind(i)
+                     for i in range(self.N)}
+        else:
+            ixmap = {}
 
         # the first `N` tensors should be the tensors of input state
         tids = tuple(U.tensor_map)[:self.N]
         for i, tid in enumerate(tids):
             t = U._pop_tensor(tid)
-            assert U.site_tag(i) in t.tags
             old_ix, = t.inds
-            ixmap[old_ix] = f'k{i}'
+
+            if transposed:
+                ixmap[old_ix] = f'k{i}'
+            else:
+                ixmap[old_ix] = f'b{i}'
 
         U.reindex_(ixmap)
         U.view_as_(
@@ -1048,6 +1071,18 @@ class Circuit:
         )
 
         return U
+
+    @property
+    def uni(self):
+        import warnings
+        warnings.warn(
+            "In future the tensor network returned by ``circ.uni`` will not "
+            "be transposed as it is currently, to match the expectation from "
+            "``U = circ.uni.to_dense()`` behaving like ``U @ psi``. You can "
+            "retain this behaviour with ``circ.get_uni(transposed=True)``.",
+            FutureWarning
+        )
+        return self.get_uni(transposed=True)
 
     def get_reverse_lightcone_tags(self, where):
         """Get the tags of gates in this circuit corresponding to the 'reverse'
@@ -1804,7 +1839,7 @@ class Circuit:
             p_marginal = p_marginal**2
 
         if fix is not None:
-            p_marginal /= nfact
+            p_marginal = p_marginal / nfact
 
         return p_marginal
 
@@ -1813,7 +1848,7 @@ class Circuit:
     compute_marginal_tn = functools.partialmethod(
         compute_marginal, rehearse="tn")
 
-    def calc_qubit_ordering(self, qubits=None):
+    def calc_qubit_ordering(self, qubits=None, method='greedy-lightcone'):
         """Get a order to measure ``qubits`` in, by greedily choosing whichever
         has the smallest reverse lightcone followed by whichever expands this
         lightcone *least*.
@@ -1836,24 +1871,40 @@ class Circuit:
         else:
             qubits = tuple(sorted(qubits))
 
-        key = ('lightcone_ordering', qubits)
+        key = ('lightcone_ordering', method, qubits)
 
         # check the cache first
         if key in self._storage:
             return self._storage[key]
 
-        cone = set()
-        lctgs = {i: set(self.get_reverse_lightcone_tags(i)) for i in qubits}
+        if method == 'greedy-lightcone':
+            cone = set()
+            lctgs = {
+                i: set(self.get_reverse_lightcone_tags(i))
+                for i in qubits
+            }
 
-        order = []
-        while lctgs:
-            # get the next qubit which adds least num gates to lightcone
-            next_qubit = min(lctgs, key=lambda i: len(lctgs[i] - cone))
-            cone |= lctgs.pop(next_qubit)
-            order.append(next_qubit)
+            order = []
+            while lctgs:
+                # get the next qubit which adds least num gates to lightcone
+                next_qubit = min(lctgs, key=lambda i: len(lctgs[i] - cone))
+                cone |= lctgs.pop(next_qubit)
+                order.append(next_qubit)
+
+        else:
+            # use graph distance based hierachical clustering
+            psi = self.get_psi_simplified('R')
+            qubit_inds = tuple(map(psi.site_ind, qubits))
+            tids = psi._get_tids_from_inds(qubit_inds, 'any')
+            matcher = re.compile(psi.site_ind_id.format(r'(\d+)'))
+            order = []
+            for tid in psi.compute_hierarchical_ordering(tids, method=method):
+                t = psi.tensor_map[tid]
+                for ind in t.inds:
+                    for sq in matcher.findall(ind):
+                        order.append(int(sq))
 
         order = self._storage[key] = tuple(order)
-
         return order
 
     def _parse_qubits_order(self, qubits=None, order=None):
@@ -2343,7 +2394,7 @@ class Circuit:
         )
 
         if rehearse == "tn":
-            return next(iter(rehs.values()))
+            return rehs
 
         return {where: rehs}
 
@@ -2407,7 +2458,8 @@ class Circuit:
             The densely represented wavefunction with ``dtype`` data.
         """
         psi = self.get_psi_simplified(
-            seq=simplify_sequence, atol=simplify_atol,
+            seq=simplify_sequence,
+            atol=simplify_atol,
             equalize_norms=simplify_equalize_norms
         )
 
@@ -2488,6 +2540,133 @@ class Circuit:
         ntensor = self._psi.num_tensors
         path = [(0, 1)] + [(0, i) for i in reversed(range(1, ntensor - 1))]
         return self.psi.contract(*args, optimize=path, **contract_opts)
+
+    def xeb(
+        self,
+        samples_or_counts,
+        cache=None,
+        cache_maxsize=2**20,
+        progbar=False,
+        **amplitude_opts,
+    ):
+        """Compute the linear cross entropy benchmark (XEB) for samples or
+        counts, amplitude per amplitude.
+
+        Parameters
+        ----------
+        samples_or_counts : Iterable[str] or Dict[str, int]
+            Either the raw bitstring samples or a dict mapping bitstrings to
+            the number of counts observed.
+        cache : dict, optional
+            A dictionary to store the probabilities in, if not supplied
+            ``quimb.utils.LRU(cache_maxsize)`` will be used.
+        cache_maxsize, optional
+            The maximum size of the cache to be used.
+        progbar, optional
+            Whether to show progress as the bitstrings are iterated over.
+        amplitude_opts
+            Supplied to :meth:`~quimb.tensor.circuit.Circuit.amplitude`.
+        """
+        try:
+            it = samples_or_counts.items()
+        except AttributeError:
+            it = zip(samples_or_counts, itertools.repeat(1))
+
+        if progbar:
+            it = _progbar(it)
+
+        M = 0
+        psum = 0.0
+
+        if cache is None:
+            cache = LRU(cache_maxsize)
+
+        for b, cnt in it:
+            try:
+                p = cache[b]
+            except KeyError:
+                p = cache[b] = abs(self.amplitude(b, **amplitude_opts))**2
+            psum += cnt * p
+            M += cnt
+
+        return (2 ** self.N) / M * psum - 1
+
+    def xeb_ex(
+        self,
+        optimize='auto-hq',
+        simplify_sequence='R',
+        simplify_atol=1e-12,
+        simplify_equalize_norms=False,
+        dtype=None,
+        backend=None,
+        autojit=False,
+        progbar=False,
+        **contract_opts
+    ):
+        """Compute the exactly expected XEB for this circuit. The main feature
+        here is that if you supply a cotengra optimizer that searches for
+        sliced indices then the XEB will be computed without constructing the
+        full wavefunction.
+
+        Parameters
+        ----------
+        optimize : str or PathOptimizer, optional
+            Contraction path optimizer.
+        simplify_sequence : str, optional
+            Simplifications to apply to tensor network prior to contraction.
+        simplify_sequence : str, optional
+            Which local tensor network simplifications to perform and in which
+            order, see
+            :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        simplify_atol : float, optional
+            The tolerance with which to compare to zero when applying
+            :meth:`~quimb.tensor.tensor_core.TensorNetwork.full_simplify`.
+        dtype : str, optional
+            Data type to cast the TN to before contraction.
+        backend : str, optional
+            Convert tensors to, and then use contractions from, this library.
+        autojit : bool, optional
+            Apply ``autoray.autojit`` to the contraciton and map-reduce.
+        progbar : bool, optional
+            Show progress in terms of number of wavefunction chunks processed.
+        """
+        # get potentially simplified TN of full wavefunction
+        psi = self.to_dense_tn(
+            simplify_sequence=simplify_sequence,
+            simplify_atol=simplify_atol,
+            simplify_equalize_norms=simplify_equalize_norms,
+            dtype=dtype,
+        )
+
+        # find a possibly sliced contraction tree
+        output_inds = tuple(map(psi.site_ind, range(self.N)))
+        tree = psi.contraction_tree(optimize=optimize, output_inds=output_inds)
+
+        arrays = psi.arrays
+        if backend is not None:
+            arrays = [do('array', x, like=backend) for x in arrays]
+
+        # perform map-reduce style computation over output wavefunction chunks
+        # so we don't need entire wavefunction in memory at same time
+        chunks = tree.gen_output_chunks(
+            arrays,
+            autojit=autojit,
+            **contract_opts
+        )
+        if progbar:
+            chunks = _progbar(chunks, total=tree.nchunks)
+
+        def f(chunk):
+            return do('sum', do('abs', chunk)**4)
+
+        if autojit:
+            # since we convert the arrays above, the jit backend is
+            # automatically inferred
+            from autoray import autojit
+            f = autojit(f)
+
+        p2sum = functools.reduce(operator.add, map(f, chunks))
+        return 2**self.N * p2sum - 1
 
     def update_params_from(self, tn):
         """Assuming ``tn`` is a tensor network with tensors tagged ``GATE_{i}``

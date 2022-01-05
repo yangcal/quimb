@@ -2,6 +2,7 @@
 """
 import textwrap
 import importlib
+import collections
 
 import numpy as np
 
@@ -9,6 +10,47 @@ from ..utils import valmap
 
 
 HAS_FA2 = importlib.util.find_spec('fa2') is not None
+
+
+def parse_dict_to_tids_or_inds(spec, tn, default='__NONE__'):
+    """Parse a dictionary possibly containing a mix of tags, tids and inds, to
+    a dictionary with only sinlge tids and inds as keys. If a tag or set of
+    tags are given as a key, all matching tensor tids will receive the value.
+    """
+    #
+    if (spec is not None) and (not isinstance(spec, dict)):
+        # assume new default value for everything
+        return collections.defaultdict(lambda: spec)
+
+    # allow not specifying a default value
+    if default != '__NONE__':
+        new = collections.defaultdict(lambda: default)
+    else:
+        new = {}
+
+    if spec is None:
+        return new
+
+    # parse the special values
+    for k, v in spec.items():
+        if (
+            # given as tid
+            (isinstance(k, int) and k in tn.tensor_map) or
+            # given as ind
+            (isinstance(k, str) and k in tn.ind_map)
+        ):
+            # already a tid
+            new[k] = v
+            continue
+
+        try:
+            for tid in tn._get_tids_from_tags(k):
+                new[tid] = v
+        except KeyError:
+            # just ignore keys that don't match any tensor
+            pass
+
+    return new
 
 
 def _add_or_merge_edge(G, u, v, attrs):
@@ -32,6 +74,7 @@ def draw_tn(
     tn,
     color=None,
     *,
+    output_inds=None,
     highlight_inds=(),
     highlight_tids=(),
     highlight_inds_color=(1.0, 0.2, 0.2, 1.0),
@@ -47,18 +90,23 @@ def draw_tn(
     iterations=200,
     initial_layout='spectral',
     use_forceatlas2=1000,
+    use_spring_weight=False,
     node_color=None,
+    node_scale=1.0,
     node_size=None,
     node_shape='o',
     node_outline_size=None,
     node_outline_darkness=0.8,
+    node_hatch='',
     edge_color=None,
     edge_scale=1.0,
     edge_alpha=1 / 2,
     multiedge_spread=0.1,
     show_left_inds=True,
     arrow_closeness=1.1,
-    arrow_length=0.1,
+    arrow_length=1.0,
+    arrow_overhang=1.0,
+    arrow_linewidth=1.0,
     label_color=None,
     font_size=10,
     font_size_inner=7,
@@ -78,6 +126,10 @@ def draw_tn(
     color : sequence of tags, optional
         If given, uniquely color any tensors which have each of the tags.
         If some tensors have more than of the tags, only one color will show.
+    output_inds : sequence of str, optional
+        For hyper tensor networks explicitly specify which indices should be
+        drawn as outer indices. If not set, the outer indices are assumed to be
+        those that only appear on a single tensor.
     highlight_inds : iterable, optional
         Highlight these edges.
     highlight_tids : iterable, optional
@@ -99,7 +151,7 @@ def draw_tn(
         Set a title for the axis.
     legend : bool, optional
         Whether to draw a legend for the colored tags.
-    fix : dict[tags, (float, float)], optional
+    fix : dict[tags_ind_or_tid], (float, float)], optional
         Used to specify actual relative positions for each tensor node.
         Each key should be a sequence of tags that uniquely identifies a
         tensor, a ``tid``, or a ``ind``, and each value should be a ``(x, y)``
@@ -118,12 +170,26 @@ def draw_tn(
         Whether to try and use ``forceatlas2`` (``fa2``) for the spring layout
         relaxation instead of ``networkx``. If an integer, only try and use
         beyond that many nodes (it can give messier results on smaller graphs).
+    use_spring_weight : bool, optional
+        Whether to use inverse bond sizes as spring weights to the force
+        repulsion layout algorithms.
     node_color : tuple[float], optional
         Default color of nodes.
-    node_size : None or float, optional
-        How big to draw the tensors.
-    node_outline_size : None or float, optional
-        The width of the border of each node.
+    node_size : None, float or dict, optional
+        How big to draw the tensors. Can be a global single value, or a dict
+        containing values for specific tags or tids. This is in absolute
+        figure units. See ``node_scale`` simply scale the node sizes up or
+        down.
+    node_scale : float, optional
+        Scale the node sizes by this factor, in addition to the automatica
+        scaling based on the number of tensors.
+    node_shape : None, str or dict, optional
+        What shape to draw the tensors. Should correspond to a matplotlib
+        scatter marker. Can be a global single value, or a dict containing
+        values for specific tags or tids.
+    node_outline_size : None, float or dict, optional
+        The width of the border of each node. Can be a global single value, or
+        a dict containing values for specific tags or tids.
     node_outline_darkness : float, optional
         Darkening of nodes outlines.
     edge_color : tuple[float], optional
@@ -140,6 +206,8 @@ def draw_tn(
         How close to draw the arrow to its target.
     arrow_length : float, optional
         The size of the arrow with respect to the edge.
+    arrow_overhang : float, optional
+        Varies the arrowhead between a triangle (0.0) and 'V' (1.0).
     label_color : tuple[float], optional
         Color to draw labels with.
     font_size : int, optional
@@ -155,10 +223,17 @@ def draw_tn(
         Explicitly set the x plot range.
     xlims : None or tuple, optional
         Explicitly set the y plot range.
-    get : {Nonr, 'pos'}, optional
-        If ``'pos'``, return the plotting positions of each ``tid`` and ``ind``
-        drawn as a node, this can supplied to subsequent calls as ``fix=pos``
-        to maintain positions, even as the graph structure changes.
+    get : {None, 'pos', 'graph'}, optional
+        If ``None`` then plot as normal, else if:
+
+            - ``'pos'``, return the plotting positions of each ``tid`` and
+              ``ind`` drawn as a node, this can supplied to subsequent calls as
+              ``fix=pos`` to maintain positions, even as the graph structure
+              changes.
+            - ``'graph'``, return the ``networkx.Graph`` object. Note that this
+              will potentially have extra nodes representing output and hyper
+              indices.
+
     return_fig : bool, optional
         If True and ``ax is None`` then return the figure created rather than
         executing ``pyplot.show()``.
@@ -169,8 +244,15 @@ def draw_tn(
     import matplotlib as mpl
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
-    from matplotlib.colors import to_rgb
+    from matplotlib.colors import to_rgb, to_rgba
     import math
+
+    if output_inds is None:
+        output_inds = set(tn.outer_inds())
+    elif isinstance(output_inds, str):
+        output_inds = {output_inds}
+    else:
+        output_inds = set(output_inds)
 
     # automatically decide whether to show tags and inds
     if show_inds is None:
@@ -186,22 +268,34 @@ def draw_tn(
 
     if edge_color is None:
         edge_color = draw_color
+    else:
+        edge_color = mpl.colors.to_rgb(edge_color)
 
     if node_color is None:
         node_color = draw_color
+    else:
+        node_color = mpl.colors.to_rgb(node_color)
 
-    # set the size of the nodes
-    if node_size is None:
-        node_size = 1000 / tn.num_tensors**0.7
-    if node_outline_size is None:
-        node_outline_size = min(3, node_size**0.5 / 5)
+    highlight_tids_color = to_rgba(highlight_tids_color)
+    highlight_inds_color = to_rgba(highlight_inds_color)
+
+    # set the size of the nodes and their border
+    node_size = parse_dict_to_tids_or_inds(
+        node_size, tn,
+        default=node_scale * 1000 / tn.num_tensors**0.7)
+    node_outline_size = parse_dict_to_tids_or_inds(
+        node_outline_size, tn,
+        default=min(3, node_size.default_factory()**0.5 / 5))
+    node_shape = parse_dict_to_tids_or_inds(
+        node_shape, tn, default='o')
+    node_hatch = parse_dict_to_tids_or_inds(
+        node_hatch, tn, default='')
 
     if label_color is None:
         label_color = mpl.rcParams['axes.labelcolor']
 
     # build the graph
     G = nx.Graph()
-
     hyperedges = []
     node_labels = dict()
     edge_labels = dict()
@@ -218,18 +312,18 @@ def draw_tn(
         edge_attrs['multiedge_sizes'] = [edge_attrs['edge_size']]
         edge_attrs['spring_weight'] = 1 / sum(t.ndim for t in tn._inds_get(ix))
 
-        if len(tids) == 2:
+        if (ix in output_inds) or (len(tids) != 2):
+            # hyper or outer edge - needs dummy 'node' shown with zero size
+            hyperedges.append(ix)
+            for tid in tids:
+                _add_or_merge_edge(G, tid, ix, edge_attrs)
+        else:
             # standard edge
             _add_or_merge_edge(G, *tids, edge_attrs)
             if show_inds == 'all':
                 edge_labels[tuple(tids)] = ix
             elif show_inds == 'bond-size':
                 edge_labels[tuple(tids)] = tn.ind_size(ix)
-        else:
-            # hyper or outer edge - needs dummy 'node' shown with zero size
-            hyperedges.append(ix)
-            for tid in tids:
-                _add_or_merge_edge(G, tid, ix, edge_attrs)
 
     # color the nodes
     colors = get_colors(color, custom_colors)
@@ -244,8 +338,8 @@ def draw_tn(
             else:
                 continue
 
-        G.nodes[tid]['size'] = node_size
-        G.nodes[tid]['outline_size'] = node_outline_size
+        G.nodes[tid]['size'] = node_size[tid]
+        G.nodes[tid]['outline_size'] = node_outline_size[tid]
         color = node_color
         for tag in colors:
             if tag in t.tags:
@@ -257,8 +351,10 @@ def draw_tn(
             (1.0 if i == 3 else node_outline_darkness) * c
             for i, c in enumerate(color)
         )
+        G.nodes[tid]['marker'] = node_shape[tid]
+        G.nodes[tid]['hatch'] = node_hatch[tid]
         if show_tags:
-            # make the tags appear with auto vertical extend
+            # make the tags appear with auto vertical extent
             node_label = '{' + str(list(t.tags))[1:-1] + '}'
             node_labels[tid] = "\n".join(textwrap.wrap(
                 node_label, max(2 * len(node_label) ** 0.5, 16)
@@ -270,21 +366,26 @@ def draw_tn(
         G.nodes[hix]['size'] = 0.0
         G.nodes[hix]['outline_size'] = 0.0
         G.nodes[hix]['outline_color'] = (1.0, 1.0, 1.0, 1.0)
+        G.nodes[hix]['marker'] = '.'  # set this to avoid warning - size is 0
+        G.nodes[hix]['hatch'] = ''
         if show_inds == 'all':
             node_labels[hix] = hix
         elif show_inds == 'bond-size':
             node_labels[hix] = tn.ind_size(hix)
 
+    if get == 'graph':
+        return G
+
     if show_inds == 'bond-size':
         font_size = font_size_inner
-        for oix in tn.outer_inds():
+        for oix in output_inds:
             node_labels[oix] = tn.ind_size(oix)
     elif show_inds:
-        for oix in tn.outer_inds():
+        for oix in output_inds:
             node_labels[oix] = oix
 
-    pos = _get_positions(tn, G, fix, initial_layout,
-                         k, iterations, use_forceatlas2)
+    pos = get_positions(tn, G, fix, initial_layout, k, iterations,
+                        use_forceatlas2, use_spring_weight)
 
     if get == 'pos':
         return pos
@@ -310,7 +411,7 @@ def draw_tn(
             #     units* and so must be inverse transformed using matplotlib!
             inv = ax.transData.inverted()
             real_node_size = (abs(
-                inv.transform((0, node_size))[1] -
+                inv.transform((0, node_size.default_factory()))[1] -
                 inv.transform((0, 0))[1]
             ) ** 0.5) / 4
             ax.set_xlim(xmin - real_node_size, xmax + real_node_size)
@@ -361,17 +462,34 @@ def draw_tn(
                     alpha=edge_alpha,
                     linewidth=sz,
                     color=attrs['color'],
+                    zorder=1,
                 ))
 
-    nx.draw_networkx_nodes(
-        G, pos,
-        node_color=tuple(x[1]['color'] for x in G.nodes(data=True)),
-        edgecolors=tuple(x[1]['outline_color'] for x in G.nodes(data=True)),
-        node_size=tuple(x[1]['size'] for x in G.nodes(data=True)),
-        linewidths=tuple(x[1]['outline_size'] for x in G.nodes(data=True)),
-        node_shape=node_shape,
-        ax=ax,
-    )
+    scatters = collections.defaultdict(lambda: collections.defaultdict(list))
+
+    for node, attrs in G.nodes(data=True):
+        # need to group by marker and hatch as matplotlib doesn't map these
+        key = (attrs['marker'], attrs['hatch'])
+        scatters[key]['x'].append(pos[node][0])
+        scatters[key]['y'].append(pos[node][1])
+        scatters[key]['s'].append(attrs['size'])
+        scatters[key]['c'].append(attrs['color'])
+        scatters[key]['linewidths'].append(attrs['outline_size'])
+        scatters[key]['edgecolors'].append(attrs['outline_color'])
+
+    # plot the nodes
+    for (marker, hatch), data in scatters.items():
+        ax.scatter(
+            data['x'],
+            data['y'],
+            s=data['s'],
+            c=data['c'],
+            marker=marker,
+            linewidths=data['linewidths'],
+            edgecolors=data['edgecolors'],
+            hatch=hatch,
+            zorder=2,
+        )
 
     # draw incomcing arrows for tensor left_inds
     if show_left_inds:
@@ -385,14 +503,21 @@ def draw_tn(
                     tidb = tid
                     (xa, ya), (xb, yb) = pos[tida], pos[tidb]
 
+                    edge_width = G.get_edge_data(tida, tidb)['edge_size']
+                    edge_length = ((xb - xa)**2 + (yb - ya)**2)**0.5
+                    arrow_scale = (
+                        0.02 * arrow_length * edge_width / edge_length**0.5
+                    )
+
                     # arrow start and change
                     if ind in multiedge_centers:
                         x, y = multiedge_centers[ind]
                     else:
                         x = (xa + arrow_closeness * xb) / (1 + arrow_closeness)
                         y = (ya + arrow_closeness * yb) / (1 + arrow_closeness)
-                    dx = (xb - xa) * arrow_length
-                    dy = (yb - ya) * arrow_length
+
+                    dx = (xb - xa) * arrow_scale
+                    dy = (yb - ya) * arrow_scale
 
                     ax.add_patch(patches.FancyArrow(
                         x, y, dx, dy,
@@ -400,9 +525,15 @@ def draw_tn(
                         length_includes_head=True,
                         head_width=(dx**2 + dy**2)**0.5,
                         head_length=(dx**2 + dy**2)**0.5,
-                        color=edge_color,
+                        linewidth=arrow_linewidth,
+                        color=(
+                            highlight_inds_color if ind in highlight_inds else
+                            edge_color
+                        ),
                         alpha=edge_alpha,
                         fill=True,
+                        shape='full',
+                        overhang=arrow_overhang,
                     ))
 
     if show_inds in {'all', 'bond-size'}:
@@ -564,13 +695,22 @@ def _massage_pos(pos, nangles=360, flatten=False):
     return dict(zip(pos, rxy0))
 
 
-def _get_positions(tn, G, fix, initial_layout,
-                   k, iterations, use_forceatlas2):
+def get_positions(
+    tn,
+    G,
+    fix=None,
+    initial_layout='spectral',
+    k=None,
+    iterations=200,
+    use_forceatlas2=False,
+    use_spring_weight=False,
+):
     import networkx as nx
 
     if fix is None:
         fix = dict()
     else:
+        fix = parse_dict_to_tids_or_inds(fix, tn)
         # find range with which to scale spectral points with
         xmin, xmax, ymin, ymax = (
             f(fix.values(), key=lambda xy: xy[i])[i]
@@ -580,17 +720,6 @@ def _get_positions(tn, G, fix, initial_layout,
         if ymin == ymax:
             ymin, ymax = ymin - 1, ymax + 1
         xymin, xymax = min(xmin, ymin), max(xmax, ymax)
-
-    # identify tensors by tid
-    fixed_positions = dict()
-    for tags_or_ind, pos in tuple(fix.items()):
-        try:
-            tid, = tn._get_tids_from_tags(tags_or_ind)
-            fixed_positions[tid] = pos
-        except KeyError:
-            # assume index
-            if (tags_or_ind in tn.tensor_map) or (tags_or_ind in tn.ind_map):
-                fixed_positions[tags_or_ind] = pos
 
     if all(node in fix for node in G.nodes):
         # everything is already fixed
@@ -604,8 +733,8 @@ def _get_positions(tn, G, fix, initial_layout,
         # but update with fixed positions
         pos0.update(valmap(lambda xy: np.array(
             (2 * (xy[0] - xymin) / (xymax - xymin) - 1,
-             2 * (xy[1] - xymin) / (xymax - xymin) - 1)), fixed_positions))
-        fixed = fixed_positions.keys()
+             2 * (xy[1] - xymin) / (xymax - xymin) - 1)), fix))
+        fixed = fix.keys()
     else:
         fixed = None
 
@@ -621,13 +750,16 @@ def _get_positions(tn, G, fix, initial_layout,
             (fixed is None) and HAS_FA2 and (len(G) > use_forceatlas2)
         )
 
+        weight = 'spring_weight' if use_spring_weight else None
+
         if should_use_fa2:
             from fa2 import ForceAtlas2
             pos = ForceAtlas2(verbose=False).forceatlas2_networkx_layout(
-                G, pos=pos0, iterations=iterations)
+                G, pos=pos0, iterations=iterations, weight_attr=weight)
         else:
             pos = nx.spring_layout(
-                G, pos=pos0, fixed=fixed, k=k, iterations=iterations)
+                G, pos=pos0, fixed=fixed, k=k, iterations=iterations,
+                weight=weight)
     else:
         pos = pos0
 

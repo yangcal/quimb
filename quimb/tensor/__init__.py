@@ -29,6 +29,8 @@ from .tensor_core import (
     Tensor,
     TensorNetwork,
     PTensor,
+    IsoTensor,
+    COPY_tensor,
     oset,
 )
 from .tensor_gen import (
@@ -36,7 +38,13 @@ from .tensor_gen import (
     rand_phased,
     TN_rand_from_edges,
     TN_rand_reg,
+    TN2D_from_fill_fn,
+    TN2D_empty,
+    TN2D_with_value,
     TN2D_rand,
+    TN3D_from_fill_fn,
+    TN3D_empty,
+    TN3D_with_value,
     TN3D_rand,
     TN2D_classical_ising_partition_function,
     TN3D_classical_ising_partition_function,
@@ -45,6 +53,9 @@ from .tensor_gen import (
     HTN_classical_partition_function_from_edges,
     TN_classical_partition_function_from_edges,
     TN_dimer_covering_from_edges,
+    TN_from_edges_and_fill_fn,
+    TN_from_edges_empty,
+    TN_from_edges_with_value,
     HTN_from_cnf,
     MPS_rand_state,
     MPS_product_state,
@@ -61,6 +72,7 @@ from .tensor_gen import (
     MPO_zeros_like,
     MPO_rand,
     MPO_rand_herm,
+    MPO_product_operator,
     SpinHam,
     SpinHam1D,
     MPO_ham_ising,
@@ -78,6 +90,7 @@ from .tensor_gen import (
     ham_2d_ising,
     ham_2d_heis,
     ham_2d_j1j2,
+    ham_3d_heis,
 )
 from .tensor_1d import (
     TensorNetwork1D,
@@ -120,6 +133,15 @@ from .circuit_gen import (
 from .optimize import (
     TNOptimizer,
 )
+from .tensor_arbgeom import (
+    tensor_network_align,
+    tensor_network_apply_op_vec,
+)
+from .tensor_arbgeom_tebd import (
+    LocalHamGen,
+    TEBDGen,
+    SimpleUpdateGen,
+)
 from .tensor_2d import (
     gen_2d_bonds,
     TensorNetwork2D,
@@ -132,6 +154,26 @@ from .tensor_2d_tebd import (
     SimpleUpdate,
     FullUpdate,
 )
+from .tensor_3d import (
+    gen_3d_bonds,
+    TensorNetwork3D,
+    PEPS3D,
+)
+from .tensor_3d_tebd import (
+    LocalHam3D,
+)
+from .geometry import (
+    edges_2d_square,
+    edges_2d_hexagonal,
+    edges_2d_triangular,
+    edges_2d_triangular_rectangular,
+    edges_2d_kagome,
+    edges_3d_cubic,
+    edges_3d_diamond,
+    edges_3d_diamond_cubic,
+    edges_3d_pyrochlore,
+)
+
 
 __all__ = (
     "set_contract_path_cache",
@@ -165,11 +207,19 @@ __all__ = (
     "TensorNetwork",
     "TNLinearOperator1D",
     "PTensor",
+    "IsoTensor",
+    "COPY_tensor",
     "oset",
     "rand_tensor",
     "rand_phased",
     "TN_rand_reg",
+    "TN2D_from_fill_fn",
+    "TN2D_empty",
+    "TN2D_with_value",
     "TN2D_rand",
+    "TN3D_from_fill_fn",
+    "TN3D_empty",
+    "TN3D_with_value",
     "TN3D_rand",
     "TN2D_classical_ising_partition_function",
     "TN3D_classical_ising_partition_function",
@@ -179,6 +229,9 @@ __all__ = (
     "HTN_classical_partition_function_from_edges",
     "TN_classical_partition_function_from_edges",
     "TN_dimer_covering_from_edges",
+    "TN_from_edges_and_fill_fn",
+    "TN_from_edges_empty",
+    "TN_from_edges_with_value",
     "HTN_from_cnf",
     "MPS_rand_state",
     "MPS_product_state",
@@ -195,6 +248,7 @@ __all__ = (
     "MPO_zeros_like",
     "MPO_rand",
     "MPO_rand_herm",
+    "MPO_product_operator",
     "SpinHam",
     "SpinHam1D",
     "MPO_ham_ising",
@@ -238,6 +292,11 @@ __all__ = (
     "circ_ansatz_1D_rand",
     "circ_qaoa",
     "TNOptimizer",
+    "tensor_network_align",
+    "tensor_network_apply_op_vec",
+    "LocalHamGen",
+    "TEBDGen",
+    "SimpleUpdateGen",
     "gen_2d_bonds",
     "TensorNetwork2D",
     "PEPS",
@@ -246,4 +305,17 @@ __all__ = (
     "TEBD2D",
     "SimpleUpdate",
     "FullUpdate",
+    "gen_3d_bonds",
+    "TensorNetwork3D",
+    "PEPS3D",
+    "LocalHam3D",
+    "edges_2d_square",
+    "edges_2d_hexagonal",
+    "edges_2d_triangular",
+    "edges_2d_triangular_rectangular",
+    "edges_2d_kagome",
+    "edges_3d_cubic",
+    "edges_3d_diamond",
+    "edges_3d_diamond_cubic",
+    "edges_3d_pyrochlore",
 )

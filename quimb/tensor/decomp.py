@@ -81,7 +81,7 @@ def _renorm_singular_vals(s, n_chi, renorm_power):
 @njit  # pragma: no cover
 def _trim_and_renorm_SVD_numba(U, s, VH, cutoff, cutoff_mode,
                                max_bond, absorb, renorm_power):
-    if cutoff > 0.0:
+    if (cutoff > 0.0) or (renorm_power > 0):
         n_chi = _trim_singular_vals_numba(s, cutoff, cutoff_mode)
 
         if max_bond > 0:
@@ -96,7 +96,7 @@ def _trim_and_renorm_SVD_numba(U, s, VH, cutoff, cutoff_mode,
             U = U[..., :n_chi]
             VH = VH[:n_chi, ...]
 
-    elif max_bond != -1:
+    elif (max_bond != -1) and (max_bond < s.shape[0]):
         U = U[..., :max_bond]
         s = s[:max_bond]
         VH = VH[:max_bond, ...]
@@ -119,7 +119,7 @@ def _trim_and_renorm_SVD_numba(U, s, VH, cutoff, cutoff_mode,
 
 def _trim_and_renorm_SVD(U, s, VH, cutoff, cutoff_mode,
                          max_bond, absorb, renorm_power):
-    if cutoff > 0.0:
+    if (cutoff > 0.0) or (renorm_power > 0):
         if cutoff_mode == 1:
             n_chi = do('count_nonzero', s > cutoff)
 
@@ -145,19 +145,21 @@ def _trim_and_renorm_SVD(U, s, VH, cutoff, cutoff_mode,
         if max_bond > 0:
             n_chi = min(n_chi, max_bond)
 
-        if n_chi < s.shape[0]:
-            s = s[:n_chi]
-            U = U[..., :n_chi]
-            VH = VH[:n_chi, ...]
+    elif max_bond > 0:
+        # only maximum bond specified
+        n_chi = max_bond
+    else:
+        # neither maximum bond dimension nor cutoff specified
+        n_chi = s.shape[0]
+
+    if n_chi < s.shape[0]:
+        s = s[:n_chi]
+        U = U[..., :n_chi]
+        VH = VH[:n_chi, ...]
 
         if renorm_power > 0:
             norm = (tot / csp[n_chi - 1]) ** (1 / p)
             s *= norm
-
-    elif max_bond > 0:
-        s = s[:max_bond]
-        U = U[..., :max_bond]
-        VH = VH[:max_bond, ...]
 
     # XXX: tensorflow can't multiply mixed dtypes
     if infer_backend(s) == 'tensorflow':
@@ -217,6 +219,29 @@ def _svd_numpy(x, cutoff=-1.0, cutoff_mode=3,
 
 
 def svd(x, cutoff=-1.0, cutoff_mode=3, max_bond=-1, absorb=0, renorm=0):
+    """Truncated svd or raw array ``x``.
+
+    Parameters
+    ----------
+    cutoff : float
+        Singular value cutoff threshold.
+    cutoff_mode : {1, 2, 3, 4, 5, 6}
+        How to perform the trim:
+
+            - 1: ['abs'], trim values below ``cutoff``
+            - 2: ['rel'], trim values below ``s[0] * cutoff``
+            - 3: ['sum2'], trim s.t. ``sum(s_trim**2) < cutoff``.
+            - 4: ['rsum2'], trim s.t. ``sum(s_trim**2) < sum(s**2) * cutoff``.
+            - 5: ['sum1'], trim s.t. ``sum(s_trim**1) < cutoff``.
+            - 6: ['rsum1'], trim s.t. ``sum(s_trim**1) < sum(s**1) * cutoff``.
+    max_bond : int
+        An explicit maximum bond dimension, use -1 for none.
+    absorb : {-1, 0, 1, None}
+        How to absorb the singular values. -1: left, 0: both, 1: right and
+        None: don't absorb (return).
+    renorm : {0, 1}
+        Whether to renormalize the singular values (depends on `cutoff_mode`).
+    """
     if isinstance(x, np.ndarray):
         return _svd_numpy(x, cutoff, cutoff_mode, max_bond, absorb, renorm)
 

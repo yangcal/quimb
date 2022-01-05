@@ -17,11 +17,15 @@ from ..gen.operators import (
 from ..gen.rand import randn, choice, random_seed_fn, rand_phase
 from .tensor_core import (Tensor, new_bond, TensorNetwork, rand_uuid,
                           tensor_direct_product)
-from .array_ops import asarray, sensibly_scale
+from .array_ops import asarray, sensibly_scale, reshape
+from .decomp import eigh
+from .tensor_arbgeom import TensorNetworkGen, TensorNetworkGenVector
 from .tensor_1d import MatrixProductState, MatrixProductOperator
 from .tensor_2d import gen_2d_bonds, TensorNetwork2D
+from .tensor_3d import TensorNetwork3D
 from .tensor_1d_tebd import LocalHam1D
 from .tensor_2d_tebd import LocalHam2D
+from .tensor_3d_tebd import LocalHam3D
 
 
 @random_seed_fn
@@ -89,6 +93,165 @@ def gen_unique_edges(edges):
         seen.add(key)
 
 
+def TN_from_edges_and_fill_fn(
+    fill_fn,
+    edges,
+    D,
+    phys_dim=None,
+    site_tag_id='I{}',
+    site_ind_id='k{}',
+):
+    """Create a tensor network from a sequence of edges defining a graph,
+    and a 'fill' function that maps shapes to data.
+
+    Parameters
+    ----------
+    fill_fn : callable
+        A function with signature ``fill_fn(shape) -> array``, used to fill
+        each tensor.
+    edges : sequence of tuple[hashable, hashable]
+        The graph edges, as a sequence of pairs of hashable objects, for
+        example integers, representing the nodes. You can redundantly specify
+        ``(u, v)`` and ``(v, u)`` and only one edge will be added.
+    D : int
+        The bond dimension connecting tensors.
+    phys_dim : int, optional
+        If not ``None``, give each tensor a 'physical', free index of this size
+        at each node.
+    site_tag_id : str, optional
+        String with formatter to tag sites.
+    site_ind_id : str, optional
+        String with formatter to tag indices (if ``phys_dim`` specified).
+
+    Returns
+    -------
+    TensorNetworkGen or TensorNetworkGenVector
+    """
+    terms = collections.defaultdict(list)
+    bonds = collections.defaultdict(rand_uuid)
+
+    for node_a, node_b in gen_unique_edges(edges):
+        bond = bonds[node_a, node_b]
+        # insert at 0 to exactly match geometry of old TN_rand_reg
+        terms[node_a].insert(0, bond)
+        terms[node_b].insert(0, bond)
+
+    ts = []
+    sites = []
+    for node, inds in sorted(terms.items(), key=lambda x: x[0]):
+        sites.append(node)
+        shape = [D] * len(inds)
+        if phys_dim is not None:
+            inds.append(site_ind_id.format(node))
+            shape.append(phys_dim)
+        data = fill_fn(shape)
+        tags = site_tag_id.format(node)
+        ts.append(Tensor(data=data, inds=inds, tags=tags))
+
+    tn = TensorNetwork(ts)
+
+    if phys_dim is not None:
+        tn.view_as_(
+            TensorNetworkGenVector, sites=sites,
+            site_tag_id=site_tag_id, site_ind_id=site_ind_id
+        )
+    else:
+        tn.view_as_(
+            TensorNetworkGen, sites=sites,
+            site_tag_id=site_tag_id
+        )
+
+    return tn
+
+
+def TN_from_edges_empty(
+    edges,
+    D,
+    phys_dim=None,
+    site_tag_id='I{}',
+    site_ind_id='k{}',
+    dtype='float64',
+):
+    """Create a tensor network from a sequence of edges defining a graph,
+    initialized with empty tensors.
+
+    Parameters
+    ----------
+    edges : sequence of tuple[hashable, hashable]
+        The graph edges, as a sequence of pairs of hashable objects, for
+        example integers, representing the nodes. You can redundantly specify
+        ``(u, v)`` and ``(v, u)`` and only one edge will be added.
+    D : int
+        The bond dimension connecting tensors.
+    phys_dim : int, optional
+        If not ``None``, give each tensor a 'physical', free index of this size
+        at each node.
+    site_tag_id : str, optional
+        String with formatter to tag sites.
+    site_ind_id : str, optional
+        String with formatter to tag indices (if ``phys_dim`` specified).
+    dtype : str, optional
+        The data type of the tensors.
+
+    Returns
+    -------
+    TensorNetworkGen or TensorNetworkGenVector
+    """
+    def fill_fn(shape):
+        return np.empty(shape, dtype=dtype)
+
+    return TN_from_edges_and_fill_fn(
+        edges=edges, D=D, fill_fn=fill_fn, phys_dim=phys_dim,
+        site_tag_id=site_tag_id, site_ind_id=site_ind_id)
+
+
+def TN_from_edges_with_value(
+    value,
+    edges,
+    D,
+    phys_dim=None,
+    site_tag_id='I{}',
+    site_ind_id='k{}',
+    dtype=None,
+):
+    """Create a tensor network from a sequence of edges defining a graph,
+    initialized with a constant value. This uses ``numpy.broadcast_to`` and
+    therefore essentially no memory.
+
+    Parameters
+    ----------
+    value : scalar
+        The value to fill the tensors with.
+    edges : sequence of tuple[hashable, hashable]
+        The graph edges, as a sequence of pairs of hashable objects, for
+        example integers, representing the nodes. You can redundantly specify
+        ``(u, v)`` and ``(v, u)`` and only one edge will be added.
+    D : int
+        The bond dimension connecting tensors.
+    phys_dim : int, optional
+        If not ``None``, give each tensor a 'physical', free index of this size
+        at each node.
+    site_tag_id : str, optional
+        String with formatter to tag sites.
+    site_ind_id : str, optional
+        String with formatter to tag indices (if ``phys_dim`` specified).
+    dtype : str, optional
+        The data type of the tensors.
+
+    Returns
+    -------
+    TensorNetworkGen or TensorNetworkGenVector
+    """
+    element = np.array(value, dtype=dtype)
+
+    def fill_fn(shape):
+        return np.broadcast_to(element, shape)
+
+    return TN_from_edges_and_fill_fn(
+        edges=edges, D=D, fill_fn=fill_fn, phys_dim=phys_dim,
+        site_tag_id=site_tag_id, site_ind_id=site_ind_id)
+
+
 def TN_rand_from_edges(
     edges,
     D,
@@ -120,10 +283,13 @@ def TN_rand_from_edges(
 
     Returns
     -------
-    TensorNetwork
+    TensorNetworkGen or TensorNetworkGenVector
     """
     ts = {}
-    for node in unique(concat(edges)):
+
+    sites = tuple(sorted(set(concat(edges))))
+
+    for node in sites:
         t = Tensor(tags=site_tag_id.format(node))
         if phys_dim is not None:
             t.new_ind(site_ind_id.format(node), size=phys_dim)
@@ -134,6 +300,17 @@ def TN_rand_from_edges(
 
     tn = TensorNetwork(ts.values())
     tn.randomize_(seed=seed, dtype=dtype)
+
+    if phys_dim is not None:
+        tn.view_as_(
+            TensorNetworkGenVector, sites=sites,
+            site_tag_id=site_tag_id, site_ind_id=site_ind_id
+        )
+    else:
+        tn.view_as_(
+            TensorNetworkGen, sites=sites,
+            site_tag_id=site_tag_id
+        )
 
     return tn
 
@@ -180,6 +357,181 @@ def TN_rand_reg(
         site_tag_id=site_tag_id, site_ind_id=site_ind_id)
 
 
+def TN2D_from_fill_fn(
+    fill_fn,
+    Lx,
+    Ly,
+    D,
+    cyclic=False,
+    site_tag_id='I{},{}',
+    row_tag_id='ROW{}',
+    col_tag_id='COL{}',
+):
+    """A scalar 2D lattice tensor network with tensors filled by a function.
+
+    Parameters
+    ----------
+    fill_fn : callable
+        A function with signature ``fill_fn(shape) -> array``, used to fill
+        each tensor.
+    Lx : int
+        Length of side x.
+    Ly : int
+        Length of side y.
+    D : int
+        The bond dimension connecting sites.
+    cyclic : bool or (bool, bool), optional
+        Whether to use periodic boundary conditions. X and Y can be specified
+        separately using a tuple.
+    site_tag_id : str, optional
+        String specifier for naming convention of site tags.
+    row_tag_id : str, optional
+        String specifier for naming convention of row tags.
+    col_tag_id : str, optional
+        String specifier for naming convention of column tags.
+
+    Returns
+    -------
+    TensorNetwork2D
+    """
+    try:
+        cyclic_x, cyclic_y = cyclic
+    except TypeError:
+        cyclic_x = cyclic_y = cyclic
+
+    ts = []
+    bonds = collections.defaultdict(rand_uuid)
+
+    for i, j in itertools.product(range(Lx), range(Ly)):
+        directions = ""
+        inds = []
+
+        if j > 0 or cyclic_y:
+            directions += 'l'
+            inds.append(bonds[(i, (j - 1) % Ly), (i, j)])
+        if j < Ly - 1 or cyclic_y:
+            directions += 'r'
+            inds.append(bonds[(i, j), (i, (j + 1) % Ly)])
+        if i < Lx - 1 or cyclic_x:
+            directions += 'u'
+            inds.append(bonds[(i, j), ((i + 1) % Lx, j)])
+        if i > 0 or cyclic_x:
+            directions += 'd'
+            inds.append(bonds[((i - 1) % Lx, j), (i, j)])
+
+        shape = (D,) * len(inds)
+        data = fill_fn(shape)
+        tags = [site_tag_id.format(i, j),
+                row_tag_id.format(i), col_tag_id.format(j)]
+        ts.append(Tensor(data=data, inds=inds, tags=tags))
+
+    tn = TensorNetwork(ts)
+
+    return tn.view_as_(
+        TensorNetwork2D,
+        Lx=Lx, Ly=Ly,
+        site_tag_id=site_tag_id,
+        row_tag_id=row_tag_id,
+        col_tag_id=col_tag_id,
+    )
+
+
+def TN2D_empty(
+    Lx,
+    Ly,
+    D,
+    cyclic=False,
+    site_tag_id='I{},{}',
+    row_tag_id='ROW{}',
+    col_tag_id='COL{}',
+    dtype='float64',
+):
+    """A scalar 2D lattice tensor network initialized with empty tensors.
+
+    Parameters
+    ----------
+    Lx : int
+        Length of side x.
+    Ly : int
+        Length of side y.
+    D : int
+        The bond dimension connecting sites.
+    cyclic : bool or (bool, bool), optional
+        Whether to use periodic boundary conditions. X and Y can be specified
+        separately using a tuple.
+    site_tag_id : str, optional
+        String specifier for naming convention of site tags.
+    row_tag_id : str, optional
+        String specifier for naming convention of row tags.
+    col_tag_id : str, optional
+        String specifier for naming convention of column tags.
+    dtype : str, optional
+        The data type of the tensors.
+
+    Returns
+    -------
+    TensorNetwork2D
+    """
+    def fill_fn(shape):
+        return np.empty(shape, dtype=dtype)
+
+    return TN2D_from_fill_fn(
+        fill_fn, Lx=Lx, Ly=Ly, D=D, cyclic=cyclic,
+        site_tag_id=site_tag_id, row_tag_id=row_tag_id, col_tag_id=col_tag_id,
+    )
+
+
+def TN2D_with_value(
+    value,
+    Lx,
+    Ly,
+    D,
+    cyclic=False,
+    site_tag_id='I{},{}',
+    row_tag_id='ROW{}',
+    col_tag_id='COL{}',
+    dtype=None,
+):
+    """A scalar 2D lattice tensor network with every element set to ``value``.
+    This uses ``numpy.broadcast_to`` and therefore essentially no memory.
+
+    Parameters
+    ----------
+    value : scalar
+        The value to fill the tensors with.
+    Lx : int
+        Length of side x.
+    Ly : int
+        Length of side y.
+    D : int
+        The bond dimension connecting sites.
+    cyclic : bool or (bool, bool), optional
+        Whether to use periodic boundary conditions. X and Y can be specified
+        separately using a tuple.
+    site_tag_id : str, optional
+        String specifier for naming convention of site tags.
+    row_tag_id : str, optional
+        String specifier for naming convention of row tags.
+    col_tag_id : str, optional
+        String specifier for naming convention of column tags.
+    dtype : str, optional
+        The data type of the tensors.
+
+    Returns
+    -------
+    TensorNetwork2D
+    """
+    element = np.array(value, dtype=dtype)
+
+    def fill_fn(shape):
+        return np.broadcast_to(element, shape)
+
+    return TN2D_from_fill_fn(
+        fill_fn, Lx=Lx, Ly=Ly, D=D, cyclic=cyclic,
+        site_tag_id=site_tag_id, row_tag_id=row_tag_id, col_tag_id=col_tag_id,
+    )
+
+
 @random_seed_fn
 def TN2D_rand(
     Lx,
@@ -212,68 +564,41 @@ def TN2D_rand(
         String specifier for naming convention of column tags.
     dtype : dtype, optional
         Data type of the random arrays.
+    seed : int, optional
+        A random seed.
 
     Returns
     -------
     TensorNetwork2D
     """
-    try:
-        cyclic_x, cyclic_y = cyclic
-    except TypeError:
-        cyclic_x = cyclic_y = cyclic
+    def fill_fn(shape):
+        return randn(shape, dtype=dtype)
 
-    ts = []
-    bonds = collections.defaultdict(rand_uuid)
-
-    for i, j in itertools.product(range(Lx), range(Ly)):
-        directions = ""
-        inds = []
-
-        if j > 0 or cyclic_y:
-            directions += 'l'
-            inds.append(bonds[(i, (j - 1) % Ly), (i, j)])
-        if j < Ly - 1 or cyclic_y:
-            directions += 'r'
-            inds.append(bonds[(i, j), (i, (j + 1) % Ly)])
-        if i < Lx - 1 or cyclic_x:
-            directions += 'u'
-            inds.append(bonds[(i, j), ((i + 1) % Lx, j)])
-        if i > 0 or cyclic_x:
-            directions += 'd'
-            inds.append(bonds[((i - 1) % Lx, j), (i, j)])
-
-        ts.append(Tensor(
-            data=randn([D] * len(inds), dtype=dtype),
-            inds=inds,
-            tags=[site_tag_id.format(i, j),
-                  row_tag_id.format(i),
-                  col_tag_id.format(j)]))
-
-    tn = TensorNetwork(ts)
-
-    return tn.view_as_(
-        TensorNetwork2D,
-        Lx=Lx, Ly=Ly,
-        site_tag_id=site_tag_id,
-        row_tag_id=row_tag_id,
-        col_tag_id=col_tag_id,
+    return TN2D_from_fill_fn(
+        fill_fn, Lx=Lx, Ly=Ly, D=D, cyclic=cyclic,
+        site_tag_id=site_tag_id, row_tag_id=row_tag_id, col_tag_id=col_tag_id,
     )
 
 
-@random_seed_fn
-def TN3D_rand(
+def TN3D_from_fill_fn(
+    fill_fn,
     Lx,
     Ly,
     Lz,
     D,
     cyclic=False,
     site_tag_id='I{},{},{}',
-    dtype='float64',
+    x_tag_id='X{}',
+    y_tag_id='Y{}',
+    z_tag_id='Z{}',
 ):
-    """A random scalar 3D lattice tensor network.
+    """A scalar 3D lattice tensor network with tensors filled by a function.
 
     Parameters
     ----------
+    fill_fn : callable
+        A function with signature ``fill_fn(shape) -> array``, used to fill
+        each tensor.
     Lx : int
         Length of side x.
     Ly : int
@@ -292,7 +617,7 @@ def TN3D_rand(
 
     Returns
     -------
-    TensorNetwork
+    TensorNetwork3D
     """
     try:
         cyclic_x, cyclic_y, cyclic_z = cyclic
@@ -325,13 +650,173 @@ def TN3D_rand(
             directions += 'd'
             inds.append(bonds[((i - 1) % Lx, j, k), (i, j, k)])
 
-        ts.append(Tensor(
-            data=randn([D] * len(inds), dtype=dtype),
-            inds=inds,
-            tags=[site_tag_id.format(i, j, k)]))
+        shape = (D,) * len(inds)
+        data = fill_fn(shape)
+        tags = [site_tag_id.format(i, j, k), x_tag_id.format(i),
+                y_tag_id.format(j), z_tag_id.format(k)]
+        ts.append(Tensor(data=data, inds=inds, tags=tags))
 
     tn = TensorNetwork(ts)
-    return tn
+
+    return tn.view_as_(
+        TensorNetwork3D,
+        Lx=Lx, Ly=Ly, Lz=Lz,
+        site_tag_id=site_tag_id,
+        x_tag_id=x_tag_id,
+        y_tag_id=y_tag_id,
+        z_tag_id=z_tag_id,
+    )
+
+
+def TN3D_empty(
+    Lx,
+    Ly,
+    Lz,
+    D,
+    cyclic=False,
+    site_tag_id='I{},{},{}',
+    x_tag_id='X{}',
+    y_tag_id='Y{}',
+    z_tag_id='Z{}',
+    dtype='float64',
+):
+    """A scalar 3D lattice tensor network initialized with empty tensors.
+
+    Parameters
+    ----------
+    Lx : int
+        Length of side x.
+    Ly : int
+        Length of side y.
+    Lz : int
+        Length of side z.
+    D : int
+        The bond dimension connecting sites.
+    cyclic : bool or (bool, bool, bool), optional
+        Whether to use periodic boundary conditions. X, Y and Z can be
+        specified separately using a tuple.
+    site_tag_id : str, optional
+        String formatter specifying how to label each site.
+    dtype : dtype, optional
+        Data type of the random arrays.
+    seed : int, optional
+        Random seed.
+
+    Returns
+    -------
+    TensorNetwork3D
+    """
+    def fill_fn(shape):
+        return np.empty(shape, dtype=dtype)
+
+    return TN3D_from_fill_fn(
+        fill_fn, Lx, Ly, Lz, D,
+        cyclic=cyclic, site_tag_id=site_tag_id,
+        x_tag_id=x_tag_id, y_tag_id=y_tag_id, z_tag_id=z_tag_id,
+    )
+
+
+def TN3D_with_value(
+    value,
+    Lx,
+    Ly,
+    Lz,
+    D,
+    cyclic=False,
+    site_tag_id='I{},{},{}',
+    x_tag_id='X{}',
+    y_tag_id='Y{}',
+    z_tag_id='Z{}',
+    dtype=None,
+):
+    """A scalar 2D lattice tensor network with every element set to ``value``.
+    This uses ``numpy.broadcast_to`` and therefore essentially no memory.
+
+    Parameters
+    ----------
+    value : scalar
+        The value to fill the tensors with.
+    Lx : int
+        Length of side x.
+    Ly : int
+        Length of side y.
+    Lz : int
+        Length of side z.
+    D : int
+        The bond dimension connecting sites.
+    cyclic : bool or (bool, bool, bool), optional
+        Whether to use periodic boundary conditions. X, Y and Z can be
+        specified separately using a tuple.
+    site_tag_id : str, optional
+        String formatter specifying how to label each site.
+    dtype : dtype, optional
+        Data type of the random arrays.
+    seed : int, optional
+        Random seed.
+
+    Returns
+    -------
+    TensorNetwork3D
+    """
+    element = np.array(value, dtype=dtype)
+
+    def fill_fn(shape):
+        return np.broadcast_to(element, shape)
+
+    return TN3D_from_fill_fn(
+        fill_fn, Lx, Ly, Lz, D,
+        cyclic=cyclic, site_tag_id=site_tag_id,
+        x_tag_id=x_tag_id, y_tag_id=y_tag_id, z_tag_id=z_tag_id,
+    )
+
+
+@random_seed_fn
+def TN3D_rand(
+    Lx,
+    Ly,
+    Lz,
+    D,
+    cyclic=False,
+    site_tag_id='I{},{},{}',
+    x_tag_id='X{}',
+    y_tag_id='Y{}',
+    z_tag_id='Z{}',
+    dtype='float64',
+):
+    """A random scalar 3D lattice tensor network.
+
+    Parameters
+    ----------
+    Lx : int
+        Length of side x.
+    Ly : int
+        Length of side y.
+    Lz : int
+        Length of side z.
+    D : int
+        The bond dimension connecting sites.
+    cyclic : bool or (bool, bool, bool), optional
+        Whether to use periodic boundary conditions. X, Y and Z can be
+        specified separately using a tuple.
+    site_tag_id : str, optional
+        String formatter specifying how to label each site.
+    dtype : dtype, optional
+        Data type of the random arrays.
+    seed : int, optional
+        Random seed.
+
+    Returns
+    -------
+    TensorNetwork
+    """
+    def fill_fn(shape):
+        return randn(shape, dtype=dtype)
+
+    return TN3D_from_fill_fn(
+        fill_fn, Lx, Ly, Lz, D,
+        cyclic=cyclic, site_tag_id=site_tag_id,
+        x_tag_id=x_tag_id, y_tag_id=y_tag_id, z_tag_id=z_tag_id,
+    )
 
 
 # ---------------------------- classical models ----------------------------- #
@@ -357,44 +842,59 @@ def classical_ising_H_matrix(beta, h=0.0):
 
 
 @functools.lru_cache(128)
-def classical_ising_sqrtS_matrix(beta, j=1.0):
+def classical_ising_sqrtS_matrix(beta, j=1.0, asymm=None):
     """The sqrt factorized interaction term for the classical ising model.
+    If ``j`` is negative you can supply ``asymm='l'`` or ``'r'`` to
+    keep the matrix real, but it must be paired with the opposite in a tensor
+    network.
     """
-    S_1_2 = np.array(
-        [[math.cosh(j * beta)**0.5 + math.sinh(j * beta)**0.5,
-          math.cosh(j * beta)**0.5 - math.sinh(j * beta)**0.5],
-         [math.cosh(j * beta)**0.5 - math.sinh(j * beta)**0.5,
-          math.cosh(j * beta)**0.5 + math.sinh(j * beta)**0.5]]
-    ) / 2**0.5
+    if (j < 0.0) and (asymm is not None):
+        Slr = eigh(classical_ising_S_matrix(beta=beta, j=j))
+        S_1_2 = {
+            'l': Slr[0], 'lT': Slr[0].T,
+            'r': Slr[-1], 'rT': Slr[-1].T,
+        }[asymm]
+    else:
+        S_1_2 = np.array(
+            [[math.cosh(j * beta)**0.5 + math.sinh(j * beta)**0.5,
+              math.cosh(j * beta)**0.5 - math.sinh(j * beta)**0.5],
+             [math.cosh(j * beta)**0.5 - math.sinh(j * beta)**0.5,
+              math.cosh(j * beta)**0.5 + math.sinh(j * beta)**0.5]]
+        ) / 2**0.5
     make_immutable(S_1_2)
     return S_1_2
 
 
 @functools.lru_cache(128)
-def classical_ising_T_matrix(beta, j=1.0, h=0.0, directions='lrud'):
+def classical_ising_T_matrix(
+    beta,
+    j=1.0,
+    h=0.0,
+    directions='lrud',
+    asymm=None,
+):
     """The single effective TN site for the classical ising model.
     """
+    try:
+        js = tuple(j)
+    except TypeError:
+        js = (j,) * len(directions)
+
+    try:
+        asymms = tuple(asymm)
+    except TypeError:
+        asymms = (asymm,) * len(directions)
+
     arrays = (
-        [classical_ising_sqrtS_matrix(beta, j=j)] * len(directions) +
+        [
+            classical_ising_sqrtS_matrix(beta=beta, j=j, asymm=a)
+            for j, a in zip(js, asymms)
+        ] +
         [classical_ising_H_matrix(beta, h)]
     )
     lhs = ",".join(f'i{x}' for x in directions)
     eq = lhs + ",i->" + directions
     return oe.contract(eq, *arrays)
-
-
-@functools.lru_cache(128)
-def classical_ising_T2d_matrix(beta, directions='lrud', j=1.0, h=0.0):
-    """The single effective TN site for the 2D classical ising model.
-    """
-    return classical_ising_T_matrix(beta, j, h, directions)
-
-
-@functools.lru_cache(128)
-def classical_ising_T3d_matrix(beta, directions='lrudab', j=1.0, h=0.0):
-    """The single effective TN site for the 3D classical ising model.
-    """
-    return classical_ising_T_matrix(beta, j, h, directions)
 
 
 def HTN2D_classical_ising_partition_function(
@@ -439,29 +939,37 @@ def HTN2D_classical_ising_partition_function(
     --------
     TN2D_classical_ising_partition_function
     """
-
-    ts = []
-
-    S = classical_ising_S_matrix(beta=beta, j=j)
-    H = classical_ising_H_matrix(beta=beta, h=h)
-
     try:
         cyclic_x, cyclic_y = cyclic
     except TypeError:
         cyclic_x = cyclic_y = cyclic
 
+    if callable(j):
+        j_factory = j
+    else:
+        def j_factory(node_a, node_b):
+            return j
+
+    ts = []
     for ni, nj in itertools.product(range(Lx), range(Ly)):
 
         if ni < Lx - 1 or cyclic_x:
-            inds = ind_id.format(ni, nj), ind_id.format((ni + 1) % Lx, nj)
-            ts.append(Tensor(S, inds=inds))
+            node_a, node_b = (ni, nj), ((ni + 1) % Lx, nj)
+            inds = ind_id.format(*node_a), ind_id.format(*node_b)
+            data = classical_ising_S_matrix(
+                beta=beta, j=j_factory(node_a, node_b))
+            ts.append(Tensor(data, inds=inds))
 
         if nj < Ly - 1 or cyclic_y:
-            inds = ind_id.format(ni, nj), ind_id.format(ni, (nj + 1) % Ly)
-            ts.append(Tensor(S, inds=inds))
+            node_a, node_b = (ni, nj), (ni, (nj + 1) % Ly)
+            inds = ind_id.format(*node_a), ind_id.format(*node_b)
+            data = classical_ising_S_matrix(
+                beta=beta, j=j_factory(node_a, node_b))
+            ts.append(Tensor(data, inds=inds))
 
         if h != 0.0:
-            ts.append(Tensor(H, inds=(ind_id.format(ni, nj),)))
+            data = classical_ising_H_matrix(beta=beta, h=h)
+            ts.append(Tensor(data, inds=(ind_id.format(ni, nj),)))
 
     return TensorNetwork(ts)
 
@@ -511,36 +1019,44 @@ def HTN3D_classical_ising_partition_function(
     --------
     TN3D_classical_ising_partition_function
     """
-
-    ts = []
-
-    S = classical_ising_S_matrix(beta=beta, j=j)
-    H = classical_ising_H_matrix(beta=beta, h=h)
-
     try:
         cyclic_x, cyclic_y, cyclic_z = cyclic
     except TypeError:
         cyclic_x = cyclic_y = cyclic_z = cyclic
 
+    if callable(j):
+        j_factory = j
+    else:
+        def j_factory(node_a, node_b):
+            return j
+
+    ts = []
     for ni, nj, nk in itertools.product(range(Lx), range(Ly), range(Lz)):
 
         if ni < Lx - 1 or cyclic_x:
-            inds = (ind_id.format(ni, nj, nk),
-                    ind_id.format((ni + 1) % Lx, nj, nk))
-            ts.append(Tensor(S, inds=inds))
+            node_a, node_b = (ni, nj, nk), ((ni + 1) % Lx, nj, nk)
+            inds = (ind_id.format(*node_a), ind_id.format(*node_b))
+            data = classical_ising_S_matrix(
+                beta=beta, j=j_factory(node_a, node_b))
+            ts.append(Tensor(data, inds=inds))
 
         if nj < Ly - 1 or cyclic_y:
-            inds = (ind_id.format(ni, nj, nk),
-                    ind_id.format(ni, (nj + 1) % Ly, nk))
-            ts.append(Tensor(S, inds=inds))
+            node_a, node_b = (ni, nj, nk), (ni, (nj + 1) % Ly, nk)
+            inds = (ind_id.format(*node_a), ind_id.format(*node_b))
+            data = classical_ising_S_matrix(
+                beta=beta, j=j_factory(node_a, node_b))
+            ts.append(Tensor(data, inds=inds))
 
         if nk < Lz - 1 or cyclic_z:
-            inds = (ind_id.format(ni, nj, nk),
-                    ind_id.format(ni, nj, (nk + 1) % Lz))
-            ts.append(Tensor(S, inds=inds))
+            node_a, node_b = (ni, nj, nk), (ni, nj, (nk + 1) % Lz)
+            inds = (ind_id.format(*node_a), ind_id.format(*node_b))
+            data = classical_ising_S_matrix(
+                beta=beta, j=j_factory(node_a, node_b))
+            ts.append(Tensor(data, inds=inds))
 
         if h != 0.0:
-            ts.append(Tensor(H, inds=(ind_id.format(ni, nj, nk),)))
+            data = classical_ising_H_matrix(beta=beta, h=h)
+            ts.append(Tensor(data, inds=(ind_id.format(ni, nj, nk),)))
 
     return TensorNetwork(ts)
 
@@ -594,28 +1110,40 @@ def TN2D_classical_ising_partition_function(
     except TypeError:
         cyclic_x = cyclic_y = cyclic
 
+    if callable(j):
+        j_factory = j
+    else:
+        def j_factory(node_a, node_b):
+            return j
+
     ts = []
     bonds = collections.defaultdict(rand_uuid)
 
     for ni, nj in itertools.product(range(Lx), range(Ly)):
         directions = ""
         inds = []
+        js = ()
+        asymms = ()
 
-        if nj > 0 or cyclic_y:
-            directions += 'l'
-            inds.append(bonds[(ni, (nj - 1) % Ly), (ni, nj)])
-        if nj < Ly - 1 or cyclic_y:
-            directions += 'r'
-            inds.append(bonds[(ni, nj), (ni, (nj + 1) % Ly)])
-        if ni < Lx - 1 or cyclic_x:
-            directions += 'u'
-            inds.append(bonds[(ni, nj), ((ni + 1) % Lx, nj)])
-        if ni > 0 or cyclic_x:
-            directions += 'd'
-            inds.append(bonds[((ni - 1) % Lx, nj), (ni, nj)])
+        for inbounds, pair, direction in [
+            (nj > 0 or cyclic_y, ((ni, (nj - 1) % Ly), (ni, nj)), 'l'),
+            (nj < Ly - 1 or cyclic_y, ((ni, nj), (ni, (nj + 1) % Ly)), 'r'),
+            (ni < Lx - 1 or cyclic_x, ((ni, nj), ((ni + 1) % Lx, nj)), 'u'),
+            (ni > 0 or cyclic_x, (((ni - 1) % Lx, nj), (ni, nj)), 'd'),
+        ]:
+            if inbounds:
+                js += (j_factory(*pair),)
+                directions += direction
+                # this is logic for handling negative j without imag tensors
+                # i.e. add the left factor if the first instance of bond, right
+                # factor if second. If j > 0.0 this doesn't matter anyhow
+                asymms += ('l' if pair not in bonds else 'rT',)
+                inds.append(bonds[pair])
 
         ts.append(Tensor(
-            data=classical_ising_T2d_matrix(beta, directions, j=j, h=h),
+            data=classical_ising_T_matrix(
+                beta=beta, directions=directions, j=js, h=h, asymm=asymms,
+            ),
             inds=inds,
             tags=[site_tag_id.format(ni, nj),
                   row_tag_id.format(ni),
@@ -641,6 +1169,9 @@ def TN3D_classical_ising_partition_function(
     h=0.0,
     cyclic=False,
     site_tag_id='I{},{},{}',
+    x_tag_id='X{}',
+    y_tag_id='Y{}',
+    z_tag_id='Z{}',
 ):
     """Tensor network representation of the 3D classical ising model
     partition function.
@@ -678,39 +1209,67 @@ def TN3D_classical_ising_partition_function(
     except TypeError:
         cyclic_x = cyclic_y = cyclic_z = cyclic
 
+    if callable(j):
+        j_factory = j
+    else:
+        def j_factory(node_a, node_b):
+            return j
+
     ts = []
     bonds = collections.defaultdict(rand_uuid)
 
     for ni, nj, nk in itertools.product(range(Lx), range(Ly), range(Lz)):
         directions = ""
         inds = []
+        js = ()
+        asymms = ()
 
-        if nk > 0 or cyclic_z:
-            directions += 'b'
-            inds.append(bonds[(ni, nj, (nk - 1) % Lz), (ni, nj, nk)])
-        if nk < Lz - 1 or cyclic_z:
-            directions += 'a'
-            inds.append(bonds[(ni, nj, nk), (ni, nj, (nk + 1) % Lz)])
-        if nj > 0 or cyclic_y:
-            directions += 'l'
-            inds.append(bonds[(ni, (nj - 1) % Ly, nk), (ni, nj, nk)])
-        if nj < Ly - 1 or cyclic_y:
-            directions += 'r'
-            inds.append(bonds[(ni, nj, nk), (ni, (nj + 1) % Ly, nk)])
-        if ni < Lx - 1 or cyclic_x:
-            directions += 'u'
-            inds.append(bonds[(ni, nj, nk), ((ni + 1) % Lx, nj, nk)])
-        if ni > 0 or cyclic_x:
-            directions += 'd'
-            inds.append(bonds[((ni - 1) % Lx, nj, nk), (ni, nj, nk)])
+        for inbounds, pair, direction in [
+            (nk > 0 or cyclic_z,
+             ((ni, nj, (nk - 1) % Lz), (ni, nj, nk)), 'b'),
+            (nk < Lz - 1 or cyclic_z,
+             ((ni, nj, nk), (ni, nj, (nk + 1) % Lz)), 'a'),
+            (nj > 0 or cyclic_y,
+             ((ni, (nj - 1) % Ly, nk), (ni, nj, nk)), 'l'),
+            (nj < Ly - 1 or cyclic_y,
+             ((ni, nj, nk), (ni, (nj + 1) % Ly, nk)), 'r'),
+            (ni < Lx - 1 or cyclic_x,
+             ((ni, nj, nk), ((ni + 1) % Lx, nj, nk)), 'u'),
+            (ni > 0 or cyclic_x,
+             (((ni - 1) % Lx, nj, nk), (ni, nj, nk)), 'd'),
+        ]:
+            if inbounds:
+                js += (j_factory(*pair),)
+                directions += direction
+                # this is logic for handling negative j without imag tensors
+                # i.e. add the left factor if the first instance of bond, right
+                # factor if second. If j > 0.0 this doesn't matter anyhow
+                asymms += ('l' if pair not in bonds else 'rT',)
+                inds.append(bonds[pair])
 
         ts.append(Tensor(
-            data=classical_ising_T3d_matrix(beta, directions, j=j, h=h),
+            data=classical_ising_T_matrix(
+                beta=beta, directions=directions, j=js, h=h, asymm=asymms,
+            ),
             inds=inds,
-            tags=[site_tag_id.format(ni, nj, nk)]))
+            tags=[
+                site_tag_id.format(ni, nj, nk),
+                x_tag_id.format(ni),
+                y_tag_id.format(nj),
+                z_tag_id.format(nk),
+            ],
+        ))
 
     tn = TensorNetwork(ts)
-    return tn
+
+    return tn.view_as_(
+        TensorNetwork3D,
+        Lx=Lx, Ly=Ly, Lz=Lz,
+        site_tag_id=site_tag_id,
+        x_tag_id=x_tag_id,
+        y_tag_id=y_tag_id,
+        z_tag_id=z_tag_id,
+    )
 
 
 def HTN_classical_partition_function_from_edges(
@@ -839,19 +1398,21 @@ def TN_classical_partition_function_from_edges(
         bond_ab = bond_ind_id.format(node_a, node_b)
 
         # left tensor factor
-        data = classical_ising_sqrtS_matrix(beta=beta, j=j_ab)
+        data = classical_ising_sqrtS_matrix(beta=beta, j=j_ab, asymm='l')
         inds = [f's{node_a}', bond_ab]
         tags = [site_tag_id.format(node_a)]
         ts.append(Tensor(data=data, inds=inds, tags=tags))
 
         # right tensor factor
-        data = classical_ising_sqrtS_matrix(beta=beta, j=j_ab)
+        data = classical_ising_sqrtS_matrix(beta=beta, j=j_ab, asymm='r')
         inds = [bond_ab, f's{node_b}']
         tags = [site_tag_id.format(node_b)]
         ts.append(Tensor(data=data, inds=inds, tags=tags))
 
         to_contract[f's{node_a}'].append(bond_ab)
         to_contract[f's{node_b}'].append(bond_ab)
+
+    sites = tuple(sorted(set(concat(edges))))
 
     if h != 0.0:
         if callable(h):
@@ -860,7 +1421,7 @@ def TN_classical_partition_function_from_edges(
             def h_factory(node):
                 return h
 
-        for node in unique(concat(edges)):
+        for node in sites:
             data = classical_ising_H_matrix(beta, h=h_factory(node))
             inds = [f's{node}']
             tags = [site_tag_id.format(node)]
@@ -872,6 +1433,7 @@ def TN_classical_partition_function_from_edges(
     for ind, output_inds in to_contract.items():
         tn.contract_ind(ind, output_inds=output_inds)
 
+    tn.view_as_(TensorNetworkGen, sites=sites, site_tag_id=site_tag_id)
     return tn
 
 
@@ -927,7 +1489,10 @@ def TN_dimer_covering_from_edges(
         tag = site_tag_id.format(node)
         ts.append(Tensor(data, inds=inds, tags=tag))
 
-    return TensorNetwork(ts)
+    tn = TensorNetwork(ts)
+    sites = tuple(sorted(nodes2inds))
+    tn.view_as_(TensorNetworkGen, sites=sites, site_tag_id=site_tag_id)
+    return tn
 
 
 # --------------------------------------------------------------------------- #
@@ -1422,6 +1987,10 @@ def MPO_zeros(L, phys_dim=2, dtype='float64', cyclic=False, **mpo_opts):
         open boundary conditions.
     mpo_opts
         Supplied to :class:`~quimb.tensor.tensor_1d.MatrixProductOperator`.
+
+    Returns
+    -------
+    MatrixProductOperator
     """
     cyc_dim = (1,) if cyclic else ()
 
@@ -1435,13 +2004,55 @@ def MPO_zeros(L, phys_dim=2, dtype='float64', cyclic=False, **mpo_opts):
 
 
 def MPO_zeros_like(mpo, **mpo_opts):
-    """Return a zeros matrix operator with the same physical index and
+    """Return a zeros matrix product operator with the same physical index and
     inds/tags as ``mpo``.
+
+    Parameters
+    ----------
+    mpo : MatrixProductOperator
+        The MPO to copy the shape of.
+
+    Returns
+    -------
+    MatrixProductOperator
     """
     return MPO_zeros(L=mpo.L, phys_dim=mpo.phys_dim(),
                      dtype=mpo.dtype, site_tag_id=mpo.site_tag_id,
                      upper_ind_id=mpo.upper_ind_id, cyclic=mpo.cyclic,
                      lower_ind_id=mpo.lower_ind_id, **mpo_opts)
+
+
+def MPO_product_operator(
+    arrays,
+    cyclic=False,
+    **mpo_opts,
+):
+    """Return an MPO of bond dimension 1 representing the product of raw
+    operators given in ``arrays``.
+
+    Parameters
+    ----------
+    arrays : sequence of 2D array_like
+        The operators to form a tensor product of.
+    cyclic : bool, optional
+        Whether to generate a cyclic MPO or not.
+    mpo_opts
+        Supplied to :class:`~quimb.tensor.tensor_1d.MatrixProductOperator`.
+
+    Returns
+    -------
+    MatrixProductOperator
+    """
+    cyc_dim = (1,) if cyclic else ()
+
+    def gen_arrays():
+        array_i, *arrays_mid, array_f = arrays
+        yield reshape(array_i, (*cyc_dim, 1, *array_i.shape))
+        for array_m in arrays_mid:
+            yield reshape(array_m, (1, 1, *array_m.shape))
+        yield reshape(array_f, (*cyc_dim, 1, *array_f.shape))
+
+    return MatrixProductOperator(gen_arrays(), shape='lrud', **mpo_opts)
 
 
 @random_seed_fn
@@ -2655,3 +3266,47 @@ def ham_2d_j1j2(Lx, Ly, j1=1.0, j2=0.5, bz=0.0, **local_ham_2d_opts):
         H1 = -bz * spin_operator('Z').real
 
     return LocalHam2D(Lx, Ly, H2=H2, H1=H1, **local_ham_2d_opts)
+
+
+def ham_3d_heis(Lx, Ly, Lz, j=1.0, bz=0.0, **local_ham_3d_opts):
+    r"""Heisenberg Hamiltonian in
+    :class:`~quimb.tensor.tensor_3d_tebd.LocalHam3D`. form.
+
+    .. math::
+
+        H_\mathrm{Heis} =
+        \sum_{<ij>} (
+            J_X \sigma^X_i \sigma^X_{j} +
+            J_Y \sigma^Y_i \sigma^Y_{j} +
+            J_Z \sigma^Z_i \sigma^Z_{j}
+            )
+        - B_Z \sum_{i} \sigma^Z_{i}
+
+    for nearest neighbors :math:`<ij>`. Note the default convention of
+    antiferromagnetic interactions and spin operators not Pauli matrices.
+
+    Parameters
+    ----------
+    Lx : int
+        The number of x-planes.
+    Ly : int
+        The number of y-planes.
+    Ly : int
+        The number of z-planes.
+    j : float or (float, float, float), optional
+        The XX, YY and ZZ interaction strength. Positive is antiferromagnetic.
+    bz : float, optional
+        The Z-magnetic field strength.
+    local_ham_3d_opts
+        Supplied to :class:`~quimb.tensor.tensor_3d_tebd.LocalHam3D`.
+
+    Returns
+    -------
+    LocalHam3D
+    """
+    H2 = ham_heis(2, j=j, cyclic=False)
+    if bz == 0.0:
+        H1 = None
+    else:
+        H1 = -bz * spin_operator('Z').real
+    return LocalHam3D(Lx, Ly, Lz, H2=H2, H1=H1, **local_ham_3d_opts)
