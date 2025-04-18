@@ -1,14 +1,75 @@
-import random
-import itertools
-import collections
+"""Tools for performing TEBD like algorithms on arbitrary lattices."""
 
-from autoray import do, to_numpy, dag
+import collections
+import itertools
+import random
+from collections.abc import Iterable
+
+from autoray import do, to_numpy
 
 from ..core import eye, kron, qarray
-from ..utils import ensure_dict
+from ..utils import (
+    ExponentialGeometricRollingDiffMean,
+    ensure_dict,
+)
 from ..utils import progbar as Progbar
-from .tensor_core import Tensor
+from ..utils_plot import default_to_neutral_style
 from .drawing import get_colors, get_positions
+from .tensor_core import Tensor
+
+
+def edge_coloring(
+    edges,
+    strategy="smallest_last",
+    interchange=True,
+    group=True,
+):
+    """Generate an edge coloring for the graph given by ``edges``, using
+    ``networkx.coloring.greedy_color``.
+
+    Parameters
+    ----------
+    edges : sequence[tuple[hashable, hashable]]
+        The edges of the graph.
+    strategy : str or callable, optional
+        The strategy to use for coloring the edges. Can be:
+
+            - 'largest_first'
+            - 'smallest_last'
+            - 'random_sequential'
+            ...
+
+    interchange : bool, optional
+        Whether to use the interchange heuristic. Usually generates better
+        colorings but can be slower.
+    group : bool, optional
+        Whether to group the edges by color or return a flat list.
+    """
+    import networkx as nx
+
+    # find vertex coloring of line graph
+    G = nx.Graph(tuple(edges))
+    edge_colors = nx.coloring.greedy_color(
+        nx.line_graph(G), strategy, interchange=interchange
+    )
+
+    # group the edges by color
+    coloring = {}
+    for edge, color in edge_colors.items():
+        coloring.setdefault(color, []).append(edge)
+
+    if group:
+        return tuple(
+            tuple(tuple(tuple(sorted(edge)) for edge in coloring[color]))
+            for color in sorted(coloring)
+        )
+    else:
+        # flatten sorted groups
+        return tuple(
+            tuple(sorted(edge))
+            for color in sorted(coloring)
+            for edge in coloring[color]
+        )
 
 
 class LocalHamGen:
@@ -101,7 +162,6 @@ class LocalHamGen:
 
         # now absorb the single site terms evenly into the two site terms
         for site, H in H1s.items():
-
             # get interacting terms which cover the site
             pairs = self._sites_to_covering_terms[site]
             num_pairs = len(pairs)
@@ -121,8 +181,7 @@ class LocalHamGen:
 
     @property
     def nsites(self):
-        """The number of sites in the system.
-        """
+        """The number of sites in the system."""
         return len(self.sites)
 
     def items(self):
@@ -135,7 +194,7 @@ class LocalHamGen:
         cache = self._op_cache["convert_from_qarray"]
         key = id(x)
         if key not in cache:
-            cache[key] = x.A
+            cache[key] = x.toarray()
         return cache[key]
 
     def _flip_cached(self, x):
@@ -168,7 +227,7 @@ class LocalHamGen:
         key = id(x)
         if key not in cache:
             xn = to_numpy(x)
-            d = int(xn.size ** 0.5)
+            d = int(xn.size**0.5)
             Id = eye(d, dtype=xn.dtype)
             XI = do("array", kron(xn, Id), like=x)
             cache[key] = XI
@@ -179,23 +238,38 @@ class LocalHamGen:
         key = id(x)
         if key not in cache:
             xn = to_numpy(x)
-            d = int(xn.size ** 0.5)
+            d = int(xn.size**0.5)
             Id = eye(d, dtype=xn.dtype)
             IX = do("array", kron(Id, xn), like=x)
             cache[key] = IX
         return cache[key]
 
-    def _expm_cached(self, x, y):
+    def _expm_cached(self, G, x):
         cache = self._op_cache["expm"]
-        key = (id(x), y)
+        key = (id(G), x)
         if key not in cache:
-            el, ev = do("linalg.eigh", x)
-            cache[key] = ev @ do("diag", do("exp", el * y)) @ dag(ev)
+            ndim_G = do("ndim", G)
+            need_to_reshape = ndim_G != 2
+            if need_to_reshape:
+                shape_orig = do("shape", G)
+                G = do(
+                    "fuse",
+                    G,
+                    range(0, ndim_G // 2),
+                    range(ndim_G // 2, ndim_G),
+                )
+
+            U = do("scipy.linalg.expm", G * x)
+
+            if need_to_reshape:
+                U = do("reshape", U, shape_orig)
+
+            cache[key] = U
+
         return cache[key]
 
     def get_gate(self, where):
-        """Get the local term for pair ``where``, cached.
-        """
+        """Get the local term for pair ``where``, cached."""
         return self.terms[tuple(sorted(where))]
 
     def get_gate_expm(self, where, x):
@@ -205,30 +279,9 @@ class LocalHamGen:
         return self._expm_cached(self.get_gate(where), x)
 
     def apply_to_arrays(self, fn):
-        """Apply the function ``fn`` to all the arrays representing terms.
-        """
+        """Apply the function ``fn`` to all the arrays representing terms."""
         for k, x in self.terms.items():
             self.terms[k] = fn(x)
-
-    def _nx_color_ordering(self, strategy="smallest_first", interchange=True):
-        """Generate a term ordering based on a coloring on the line graph.
-        """
-        import networkx as nx
-
-        G = nx.Graph()
-        for site_a, site_b in self.terms:
-            G.add_edge(site_a, site_b)
-
-        coloring = list(
-            nx.coloring.greedy_color(
-                nx.line_graph(G), strategy, interchange=interchange
-            ).items()
-        )
-
-        # sort into color groups
-        coloring.sort(key=lambda coo_color: coo_color[1])
-
-        return [coo for coo, _ in coloring]
 
     def get_auto_ordering(self, order="sort", **kwargs):
         """Get an ordering of the terms to use with TEBD, for example. The
@@ -253,7 +306,7 @@ class LocalHamGen:
                   commutation.
 
             Any other option will be passed as a strategy to
-            ``networkx.coloring.greedy_color`` to generate the ordering.
+            :func:`networkx.coloring.greedy_color` to generate the ordering.
 
         Returns
         -------
@@ -272,7 +325,7 @@ class LocalHamGen:
             random.shuffle(pairs)
             return pairs
         else:
-            return self._nx_color_ordering(order, **kwargs)
+            return edge_coloring(self.terms, order, group=False, **kwargs)
 
         pairs = {x: None for x in pairs}
 
@@ -294,6 +347,7 @@ class LocalHamGen:
         s = "<LocalHamGen(nsites={}, num_terms={})>"
         return s.format(self.nsites, len(self.terms))
 
+    @default_to_neutral_style
     def draw(
         self,
         ordering="sort",
@@ -302,7 +356,6 @@ class LocalHamGen:
         fontsize=8,
         legend=True,
         ax=None,
-        return_fig=False,
         **kwargs,
     ):
         """Plot this Hamiltonian as a network.
@@ -311,7 +364,7 @@ class LocalHamGen:
         ----------
         ordering : {'sort', None, 'random'}, optional
             An ordering of the termns, or an argument to be supplied to
-            :meth:`quimb.tensor.tensor_gen_tebd.LocalHamGen.get_auto_ordering`
+            :meth:`quimb.tensor.tensor_arbgeom_tebd.LocalHamGen.get_auto_ordering`
             to generate this automatically.
         show_norm : bool, optional
             Show the norm of each term as edge labels.
@@ -323,14 +376,12 @@ class LocalHamGen:
             Whether to show the legend of which terms are in which group.
         ax : None or matplotlib.Axes, optional
             Add to a existing set of axes.
-        return_fig : bool, optional
-            Whether to return any newly created figure.
         """
-        import networkx as nx
         import matplotlib.pyplot as plt
+        import networkx as nx
 
         if figsize is None:
-            L = self.nsites ** 0.5 + 1
+            L = self.nsites**0.5 + 1
             figsize = (L, L)
 
         ax_supplied = ax is not None
@@ -338,6 +389,8 @@ class LocalHamGen:
             fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
             ax.axis("off")
             ax.set_aspect("equal")
+        else:
+            fig = None
 
         if ordering is None or isinstance(ordering, str):
             ordering = self.get_auto_ordering(ordering, **kwargs)
@@ -419,13 +472,7 @@ class LocalHamGen:
                 bbox_to_anchor=(1, 0.5),
             )
 
-        if ax_supplied:
-            return
-
-        if return_fig:
-            return fig
-
-        plt.show()
+        return fig, ax
 
     graph = draw
 
@@ -442,6 +489,7 @@ class TEBDGen:
         ham,
         tau=0.01,
         D=None,
+        cutoff=1e-10,
         imag=True,
         gate_opts=None,
         ordering=None,
@@ -451,6 +499,7 @@ class TEBDGen:
         compute_energy_opts=None,
         compute_energy_fn=None,
         compute_energy_per_site=False,
+        tol=None,
         callback=None,
         keep_best=False,
         progbar=True,
@@ -466,14 +515,15 @@ class TEBDGen:
 
         # default time step to use
         self.tau = tau
+        self.last_tau = 0.0
 
         # parse gate application options
         if D is None:
             D = self._psi.max_bond()
         self.gate_opts = ensure_dict(gate_opts)
-        self.gate_opts['max_bond'] = D
-        self.gate_opts.setdefault('cutoff', 0.0)
-        self.gate_opts.setdefault('contract', 'reduce-split')
+        self.gate_opts["max_bond"] = D
+        self.gate_opts.setdefault("cutoff", cutoff)
+        self.gate_opts.setdefault("contract", "reduce-split")
 
         # parse energy computation options
         self.compute_energy_opts = ensure_dict(compute_energy_opts)
@@ -482,11 +532,12 @@ class TEBDGen:
         self.compute_energy_final = compute_energy_final
         self.compute_energy_fn = compute_energy_fn
         self.compute_energy_per_site = bool(compute_energy_per_site)
+        self.tol = tol
 
         if ordering is None:
 
             def dynamic_random():
-                return self.ham.get_auto_ordering('random_sequential')
+                return self.ham.get_auto_ordering("random_sequential")
 
             self.ordering = dynamic_random
         elif isinstance(ordering, str):
@@ -503,9 +554,12 @@ class TEBDGen:
         self.its = []
         self.taus = []
         self.energies = []
+        self.energy_diffs = []
+        self.egrdm = ExponentialGeometricRollingDiffMean()
 
         self.keep_best = bool(keep_best)
-        self.best = dict(energy=float('inf'), state=None, it=None)
+        self.best = dict(energy=float("inf"), state=None, it=None)
+        self.stop = False
 
     def sweep(self, tau):
         r"""Perform a full sweep of gates at every pair.
@@ -526,17 +580,34 @@ class TEBDGen:
         else:
             factor = 1.0
 
+        layer = set()
+
         for where in ordering:
+            if any(coo in layer for coo in where):
+                # starting a new non-commuting layer
+                self.postlayer()
+                layer = set(where)
+            else:
+                # add to the current layer
+                layer.update(where)
 
             if callable(tau):
-                U = self.ham.get_gate_expm(where, -tau(where) / factor)
+                self.last_tau = tau(where)
             else:
-                U = self.ham.get_gate_expm(where, -tau / factor)
+                self.last_tau = tau
 
-            self.gate(U, where)
+            G = self.ham.get_gate_expm(where, -self.last_tau / factor)
 
-    def _update_progbar(self, pbar):
-        desc = f"n={self._n}, tau={self.tau}, energy~{float(self.energy):.6f}"
+            self.gate(G, where)
+
+        self.postlayer()
+
+    def _set_progbar_description(self, pbar):
+        desc = f"n={self._n}, tau={float(self.last_tau):.2g}"
+        if getattr(self, "gauge_diffs", None):
+            desc += f", max|dS|={self.gauge_diffs[-1]:.2g}"
+        if self.energies:
+            desc += f", energy~{float(self.energies[-1]):.6g}"
         pbar.set_description(desc)
 
     def evolve(self, steps, tau=None, progbar=None):
@@ -544,39 +615,61 @@ class TEBDGen:
         time step ``tau``.
         """
         if tau is not None:
-            self.tau = tau
+            if isinstance(tau, Iterable):
+                taus = itertools.chain(tau, itertools.repeat(tau[-1]))
+            else:
+                self.tau = tau
+                taus = itertools.repeat(tau)
 
         if progbar is None:
             progbar = self.progbar
 
-        pbar = Progbar(total=steps, disable=self.progbar is not True)
+        pbar = Progbar(total=steps, disable=not progbar)
 
         try:
-            for i in range(steps):
+            for i, tau in zip(range(steps), taus):
                 # anything required by both energy and sweep
                 self.presweep(i)
 
                 # possibly compute the energy
-                should_compute_energy = (
-                    bool(self.compute_energy_every) and
-                    (i % self.compute_energy_every == 0))
+                should_compute_energy = bool(self.compute_energy_every) and (
+                    i % self.compute_energy_every == 0
+                )
                 if should_compute_energy:
                     self._check_energy()
-                    self._update_progbar(pbar)
+                    self._set_progbar_description(pbar)
+
+                    # check for convergence
+                    self.stop = (self.tol is not None) and (
+                        self.energy_diffs[-1] < self.tol
+                    )
+
+                if self.stop:
+                    # maybe stop pre sweep
+                    self.stop = False
+                    break
 
                 # actually perform the gates
-                self.sweep(self.tau)
+                self.sweep(tau)
+                self.postsweep(i)
+
                 self._n += 1
                 pbar.update()
+                self._set_progbar_description(pbar)
 
                 if self.callback is not None:
                     if self.callback(self):
                         break
 
+                if self.stop:
+                    # maybe stop post sweep
+                    self.stop = False
+                    break
+
             # possibly compute the energy
             if self.compute_energy_final:
                 self._check_energy()
-                self._update_progbar(pbar)
+                self._set_progbar_description(pbar)
 
         except KeyboardInterrupt:
             # allow the user to interupt early
@@ -586,8 +679,7 @@ class TEBDGen:
 
     @property
     def state(self):
-        """Return a copy of the current state.
-        """
+        """Return a copy of the current state."""
         return self.get_state()
 
     @state.setter
@@ -596,25 +688,21 @@ class TEBDGen:
 
     @property
     def n(self):
-        """The number of sweeps performed.
-        """
+        """The number of sweeps performed."""
         return self._n
 
     @property
     def D(self):
-        """The maximum bond dimension.
-        """
-        return self.gate_opts['max_bond']
+        """The maximum bond dimension."""
+        return self.gate_opts["max_bond"]
 
     @D.setter
     def D(self, value):
-        """The maximum bond dimension.
-        """
-        self.gate_opts['max_bond'] = round(value)
+        """The maximum bond dimension."""
+        self.gate_opts["max_bond"] = round(value)
 
     def _check_energy(self):
-        """Logic for maybe computing the energy if needed.
-        """
+        """Logic for maybe computing the energy if needed."""
         if self.its and (self._n == self.its[-1]):
             # only compute if haven't already
             return self.energies[-1]
@@ -627,21 +715,28 @@ class TEBDGen:
         if self.compute_energy_per_site:
             en = en / self.ham.nsites
 
-        self.energies.append(float(en))
-        self.taus.append(float(self.tau))
         self.its.append(self._n)
+        self.taus.append(float(self.last_tau))
 
-        if self.keep_best and en < self.best['energy']:
-            self.best['energy'] = en
-            self.best['state'] = self.state
-            self.best['it'] = self._n
+        # update the energy and possibly the best state
+        self.energies.append(float(en))
+        if self.keep_best and en < self.best["energy"]:
+            self.best["energy"] = en
+            self.best["state"] = self.state
+            self.best["it"] = self._n
+
+        # update the energy difference mean and possibly marked converged
+        self.egrdm.update(float(en))
+        self.energy_diffs.append(self.egrdm.value)
+
+        if self.tol is not None:
+            self.stop = self.energy_diffs[-1] < self.tol
 
         return self.energies[-1]
 
     @property
     def energy(self):
-        """Return the energy of current state, computing it only if necessary.
-        """
+        """Return the energy of current state, computing it only if necessary."""
         return self._check_energy()
 
     # ------- abstract methods that subclasses might want to override ------- #
@@ -660,7 +755,19 @@ class TEBDGen:
 
     def presweep(self, i):
         """Perform any computations required before the sweep (and energy
-        computation). For the basic TEBD this is nothing.
+        computation). For the basic TEBD update is nothing.
+        """
+        pass
+
+    def postlayer(self):
+        """Perform any computations required after each layer of commuting
+        gates. For the basic update this is nothing.
+        """
+        pass
+
+    def postsweep(self, i):
+        """Perform any computations required after the sweep (but before
+        the energy computation). For the basic update this is nothing.
         """
         pass
 
@@ -674,33 +781,339 @@ class TEBDGen:
         """Compute and return the energy of the current state. Subclasses can
         override this with a custom method to compute the energy.
         """
-        return self._psi.compute_local_expectation_simple(
-            terms=self.ham.terms,
-            **self.compute_energy_opts
+        return self._psi.compute_local_expectation_cluster(
+            terms=self.ham.terms, **self.compute_energy_opts
         )
+
+    @default_to_neutral_style
+    def plot(
+        self,
+        zoom="auto",
+        xscale="symlog",
+        xscale_linthresh=20,
+        color_energy=(0.0, 0.5, 1.0),
+        color_gauge_diff=(1.0, 0.5, 0.0),
+        hlines=(),
+        figsize=(8, 4),
+    ):
+        """Plot an overview of the evolution of the energy and gauge diffs.
+
+        Parameters
+        ----------
+        zoom : int or 'auto', optional
+            The number of iterations to zoom in on, or 'auto' to automatically
+            choose a reasonable zoom level.
+        xscale : {'linear', 'log', 'symlog'}, optional
+            The x-axis scale, for the upper plot of the entire evolution.
+        xscale_linthresh : float, optional
+            The linear threshold for the upper symlog scale.
+        color_energy : str or tuple, optional
+            The color to use for the energy plot.
+        color_gauge_diff : str or tuple, optional
+            The color to use for the gauge diff plot.
+        hlines : dict, optional
+            Add horizontal lines to the plot, with keys as labels and values
+            as the y-values.
+        figsize : tuple, optional
+            The size of the figure.
+
+        Returns
+        -------
+        fig, axs : matplotlib.Figure, tuple[matplotlib.Axes]
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from matplotlib.ticker import ScalarFormatter
+        from matplotlib.colors import hsv_to_rgb
+
+        def set_axis_color(ax, which, color):
+            ax.spines[which].set_visible(True)
+            ax.spines[which].set_color(color)
+            ax.yaxis.label.set_color(color)
+            ax.tick_params(axis="y", colors=color, which="both")
+
+        x_en = np.array(self.its)
+        y_en = np.array(self.energies)
+        x_gd = np.arange(1, len(self.gauge_diffs) + 1)
+        y_gd = np.array(self.gauge_diffs)
+
+        if zoom is not None:
+            if zoom == "auto":
+                zoom = min(200, self.n // 2)
+        nz = self.n - zoom
+
+        fig, axs = plt.subplots(nrows=2, figsize=figsize)
+
+        # plotted zoomed out
+        # energy
+        axl = axs[0]
+        axl.plot(x_en, y_en, marker="|", color=color_energy)
+        axl.set_xscale(xscale, linthresh=xscale_linthresh)
+        axl.set_ylabel("Energy")
+        axl.yaxis.set_major_formatter(ScalarFormatter(useOffset=False))
+        set_axis_color(axl, "left", color_energy)
+        # gauge diff
+        axr = axl.twinx()
+        axr.plot(
+            x_gd,
+            y_gd,
+            linestyle="--",
+            color=color_gauge_diff,
+        )
+        axr.set_ylabel("Max gauge diff")
+        axr.set_yscale("log")
+        set_axis_color(axr, "right", color_gauge_diff)
+
+        axl.axvline(
+            nz,
+            color=(0.5, 0.5, 0.5, 0.5),
+            linestyle="-",
+            linewidth=1,
+        )
+
+        # plotted zoomed in
+        # energy
+        iz = min(range(len(x_en)), key=lambda i: x_en[i] < nz)
+        axl = axs[1]
+        axl.plot(x_en[iz:], y_en[iz:], marker="|", color=color_energy)
+        axl.set_ylabel("Energy")
+        axl.yaxis.set_major_formatter(ScalarFormatter(useOffset=False))
+        set_axis_color(axl, "left", color_energy)
+        axl.set_xlabel("Iteration")
+        # gauge diff
+        iz = min(range(len(x_gd)), key=lambda i: x_gd[i] < nz)
+        axr = axl.twinx()
+        axr.plot(
+            x_gd[iz:],
+            y_gd[iz:],
+            linestyle="--",
+            color=color_gauge_diff,
+        )
+        axr.set_ylabel("Max gauge diff")
+        axr.set_yscale("log")
+        set_axis_color(axr, "right", color_gauge_diff)
+
+        if hlines:
+            hlines = dict(hlines)
+            for i, (label, value) in enumerate(hlines.items()):
+                color = hsv_to_rgb([(0.45 - (0.08 * i)) % 1.0, 0.7, 0.6])
+                axs[0].axhline(value, color=color, ls=":", label=label)
+                axs[1].axhline(value, color=color, ls=":", label=label)
+                axs[0].text(
+                    1, value, label, color=color, va="bottom", ha="left"
+                )
+                axs[1].text(
+                    nz, value, label, color=color, va="bottom", ha="left"
+                )
+
+        return fig, axs
 
     def __repr__(self):
         s = "<{}(n={}, tau={}, D={})>"
-        return s.format(
-            self.__class__.__name__, self.n, self.tau, self.D)
+        return s.format(self.__class__.__name__, self.n, self.tau, self.D)
 
 
 class SimpleUpdateGen(TEBDGen):
+    """Simple update for arbitrary geometry hamiltonians.
 
-    def gate(self, U, where):
-        self._psi.gate_simple_(
-            U, where, gauges=self.gauges, **self.gate_opts
+    Parameters
+    ----------
+    psi0 : TensorNetworkGenVector
+        The initial state.
+    ham : LocalHamGen
+        The local hamiltonian.
+    tau : float, optional
+        The default time step to use.
+    D : int, optional
+        The maximum bond dimension, by default the current maximum bond of
+        ``psi0``.
+    cutoff : float, optional
+        The singular value cutoff to use when applying gates.
+    imag : bool, optional
+        Whether to evolve in imaginary time (default) or real time.
+    gate_opts : dict, optional
+        Other options to supply to the gate application method,
+        :meth:`quimb.tensor.tensor_arbgeom.TensorNetworkGenVector.gate_simple_`.
+    ordering : None, str or callable, optional
+        The ordering of the terms to apply, by default this will be determined
+        automatically.
+    second_order_reflect : bool, optional
+        Whether to use a second order Trotter decomposition by reflecting the
+        ordering.
+    compute_energy_every : int, optional
+        Compute the energy every this many steps.
+    compute_energy_final : bool, optional
+        Whether to compute the energy at the end.
+    compute_energy_opts : dict, optional
+        Options to supply to the energy computation method,
+        :func:`quimb.tensor.tensor_arbgeom.TensorNetworkGenVector.compute_local_expectation_cluster`.
+    compute_energy_fn : callable, optional
+        A custom function to compute the energy, with signature ``fn(su)``,
+        where ``su`` is this instance.
+    compute_energy_per_site : bool, optional
+        Whether to compute the energy per site.
+    tol : float, optional
+        If not ``None``, stop when either energy difference falls below this
+        value, or maximum singluar value changes fall below this value.
+    equilibrate_every : int, optional
+        Equilibrate the gauges every this many steps.
+    equilibrate_start : bool, optional
+        Whether to equilibrate the gauges at the start, regardless of
+        ``equilibrate_every``.
+    equilibrate_opts : dict, optional
+        Default options to supply to the gauge equilibration method, see
+        :meth:`quimb.tensor.tensor_core.TensorNetwork.gauge_all_simple`. By
+        default `max_iterations` is set to 100 and `tol` to 1e-3.
+    callback : callable, optional
+        A function to call after each step, with signature ``fn(su)``.
+    keep_best : bool, optional
+        Whether to keep track of the best state and energy.
+    progbar : bool, optional
+        Whether to show a progress bar during evolution.
+    """
+
+    def __init__(
+        self,
+        psi0,
+        ham,
+        tau=0.01,
+        D=None,
+        cutoff=1e-10,
+        imag=True,
+        gate_opts=None,
+        ordering=None,
+        second_order_reflect=False,
+        compute_energy_every=None,
+        compute_energy_final=True,
+        compute_energy_opts=None,
+        compute_energy_fn=None,
+        compute_energy_per_site=False,
+        tol=None,
+        equilibrate_every=0,
+        equilibrate_start=True,
+        equilibrate_opts=None,
+        callback=None,
+        keep_best=False,
+        progbar=True,
+    ):
+        self.equilibrate_every = equilibrate_every
+        self.equilibrate_start = bool(equilibrate_start)
+        self.equilibrate_opts = equilibrate_opts or {}
+        self.equilibrate_opts.setdefault("max_iterations", 100)
+        self.equilibrate_opts.setdefault("tol", 1e-3)
+
+        self.gauges_prev = None
+        self.gauge_diffs = []
+
+        return super().__init__(
+            psi0,
+            ham,
+            tau=tau,
+            D=D,
+            cutoff=cutoff,
+            imag=imag,
+            gate_opts=gate_opts,
+            ordering=ordering,
+            second_order_reflect=second_order_reflect,
+            compute_energy_every=compute_energy_every,
+            compute_energy_final=compute_energy_final,
+            compute_energy_opts=compute_energy_opts,
+            compute_energy_fn=compute_energy_fn,
+            compute_energy_per_site=compute_energy_per_site,
+            tol=tol,
+            callback=callback,
+            keep_best=keep_best,
+            progbar=progbar,
         )
 
+    def gate(self, G, where):
+        """Application of a single gate ``G`` at ``where``."""
+        self._psi.gate_simple_(G, where, gauges=self.gauges, **self.gate_opts)
+
+        if self.equilibrate_every == "gate":
+            tags = [self._psi.site_tag(x) for x in where]
+            tids = self._psi._get_tids_from_tags(tags, "any")
+            self.equilibrate(touched_tids=tids)
+
+    def equilibrate(self, **kwargs):
+        """Equilibrate the gauges with the current state (like evolving with
+        tau=0).
+        """
+        # allow overriding of default options
+        kwargs = {**self.equilibrate_opts, **kwargs}
+        self._psi.gauge_all_simple_(gauges=self.gauges, **kwargs)
+
+    def postlayer(self):
+        """Performed after each layer of commuting gates."""
+        if self.equilibrate_every == "layer":
+            self.equilibrate()
+
+    def postsweep(self, i):
+        """Performed after every full sweep."""
+        should_equilibrate = (
+            # str settings are equilibrated elsewhere
+            (not isinstance(self.equilibrate_every, str))
+            and (self.equilibrate_every > 0)
+            and (i % self.equilibrate_every == 0)
+        )
+
+        if should_equilibrate:
+            self.equilibrate()
+
+        # check gauges for convergence / progbar
+        if self.gauges_prev is not None:
+            sdiffs = []
+            for k, g in self.gauges.items():
+                g_prev = self.gauges_prev[k]
+                try:
+                    sdiff = do("linalg.norm", g - g_prev)
+                except ValueError:
+                    # gauge has changed size
+                    sdiff = 1.0
+                sdiffs.append(sdiff)
+
+            max_sdiff = max(sdiffs)
+            self.gauge_diffs.append(max_sdiff)
+
+            if self.tol is not None and (max_sdiff < self.tol):
+                self.stop = True
+
+        self.gauges_prev = self.gauges.copy()
+
+    def normalize(self):
+        """Normalize the state and simple gauges."""
+        self._psi.normalize_simple(self.gauges)
+
     def compute_energy(self):
-        return self._psi.compute_local_expectation_simple(
+        """Default estimate of the energy."""
+        return self._psi.compute_local_expectation_cluster(
             terms=self.ham.terms,
             gauges=self.gauges,
             **self.compute_energy_opts,
         )
 
     def get_state(self, absorb_gauges=True):
+        """Return the current state, possibly absorbing the gauges.
+
+        Parameters
+        ----------
+        absorb_gauges : bool or "return", optional
+            Whether to absorb the gauges into the state or not. If `True`, a
+            standard PEPS is returned with the gauges absorbed. If `False``,
+            the gauges are added to the tensor network but uncontracted. If
+            "return", the gauges are returned separately.
+
+        Returns
+        -------
+        psi : TensorNetwork
+            The current state.
+        gauges : dict
+            The current gauges, if ``absorb_gauges == "return"``.
+        """
         psi = self._psi.copy()
+
+        if absorb_gauges == "return":
+            return psi, self.gauges.copy()
 
         if absorb_gauges:
             psi.gauge_simple_insert(self.gauges)
@@ -710,7 +1123,14 @@ class SimpleUpdateGen(TEBDGen):
 
         return psi
 
-    def set_state(self, psi):
+    def set_state(self, psi, gauges=None):
+        """Set the current state and possibly the gauges."""
         self._psi = psi.copy()
-        self.gauges = {}
-        self._psi.gauge_all_simple_(gauges=self.gauges)
+        if gauges is None:
+            self.gauges = {}
+            self._psi.gauge_all_simple_(max_iterations=1, gauges=self.gauges)
+        else:
+            self.gauges = dict(gauges)
+
+        if self.equilibrate_start:
+            self.equilibrate()

@@ -1,13 +1,21 @@
-"""Backend agnostic array operations.
-"""
+"""Backend agnostic array operations."""
+
+import functools
 import itertools
 
 import numpy
-from autoray import do, reshape, transpose, dag, infer_backend, get_dtype_name
+from autoray import (
+    compose,
+    do,
+    get_dtype_name,
+    get_lib_fn,
+    infer_backend,
+    reshape,
+)
 
 from ..core import njit, qarray
-from ..utils import compose
 from ..linalg.base_linalg import norm_fro_dense
+from ..utils import compose as fn_compose
 
 
 def asarray(array):
@@ -20,7 +28,7 @@ def asarray(array):
         # if numpy make sure array not subclass
         return numpy.asarray(array)
 
-    if hasattr(array, 'shape'):
+    if hasattr(array, "shape"):
         # otherwise don't touch things which are already array like
         return array
 
@@ -33,14 +41,14 @@ def asarray(array):
             return x
 
         backend = infer_backend(x)
-        if backend != 'builtins':
+        if backend != "builtins":
             # don't iterate any non-builtin containers
             backends.add(backend)
             return x
 
         # is some kind of python container or element -> iterate or return
         try:
-            return tuple(_nd_py_iter(sub) for sub in x)
+            return list(_nd_py_iter(sub) for sub in x)
         except TypeError:
             return x
 
@@ -51,134 +59,194 @@ def asarray(array):
     if not backends:
         backend = "numpy"
     else:
-        backend, = backends
+        (backend,) = backends
 
-    return do('array', nested_tup, like=backend)
+    return do("array", nested_tup, like=backend)
+
+
+_blocksparselookup = {}
+
+
+def isblocksparse(x):
+    """Check if `x` is a block-sparse array. Cached on class for speed."""
+    try:
+        return _blocksparselookup[x.__class__]
+    except KeyError:
+        # XXX: make this a more established interface
+        isbs = hasattr(x, "align_axes")
+        _blocksparselookup[x.__class__] = isbs
+        return isbs
+
+
+_fermioniclookup = {}
+
+
+def isfermionic(x):
+    """Check if `x` is a fermionic array. Cached on class for speed."""
+    try:
+        return _fermioniclookup[x.__class__]
+    except KeyError:
+        # XXX: make this a more established interface
+        isf = hasattr(x, "phase_flip")
+        _fermioniclookup[x.__class__] = isf
+        return isf
+
+
+@functools.lru_cache(2**14)
+def calc_fuse_perm_and_shape(shape, axes_groups):
+    ndim = len(shape)
+
+    # which group does each axis appear in, if any
+    num_groups = len(axes_groups)
+    ax2group = {ax: g for g, axes in enumerate(axes_groups) for ax in axes}
+
+    # the permutation will be the same for every block: precalculate
+    # n.b. all new groups will be inserted at the *first fused axis*
+    position = min(g for gax in axes_groups for g in gax)
+    axes_before = tuple(
+        ax for ax in range(position) if ax2group.setdefault(ax, None) is None
+    )
+    axes_after = tuple(
+        ax
+        for ax in range(position, ndim)
+        if ax2group.setdefault(ax, None) is None
+    )
+    perm = (*axes_before, *(ax for g in axes_groups for ax in g), *axes_after)
+
+    # track where each axis will be in the new array
+    new_axes = {ax: ax for ax in axes_before}
+    for i, g in enumerate(axes_groups):
+        for ax in g:
+            new_axes[ax] = position + i
+    for i, ax in enumerate(axes_after):
+        new_axes[ax] = position + num_groups + i
+    new_ndim = len(axes_before) + num_groups + len(axes_after)
+
+    new_shape = [1] * new_ndim
+    for i, d in enumerate(shape):
+        g = ax2group[i]
+        new_ax = new_axes[i]
+        if g is None:
+            # not fusing, new value is just copied
+            new_shape[new_ax] = d
+        else:
+            # fusing: need to accumulate
+            new_shape[new_ax] *= d
+
+    if all(i == ax for i, ax in enumerate(perm)):
+        # no need to transpose
+        perm = None
+
+    new_shape = tuple(new_shape)
+    if shape == new_shape:
+        # no need to reshape
+        new_shape = None
+
+    return perm, new_shape
+
+
+@compose
+def fuse(x, *axes_groups, backend=None):
+    """Fuse the give group or groups of axes. The new fused axes will be
+    inserted at the minimum index of any fused axis (even if it is not in
+    the first group). For example, ``fuse(x, [5, 3], [7, 2, 6])`` will
+    produce an array with axes like::
+
+        groups inserted at axis 2, removed beyond that.
+                ......<--
+        (0, 1, g0, g1, 4, 8, ...)
+                |   |
+                |   g1=(7, 2, 6)
+                g0=(5, 3)
+
+    Parameters
+    ----------
+    axes_groups : sequence of sequences of int
+        The axes to fuse. Each group of axes will be fused into a single
+        axis.
+    """
+    if backend is None:
+        backend = infer_backend(x)
+    _transpose = get_lib_fn(backend, "transpose")
+    _reshape = get_lib_fn(backend, "reshape")
+
+    axes_groups = tuple(map(tuple, axes_groups))
+    if not any(axes_groups):
+        return x
+
+    shape = tuple(map(int, x.shape))
+    perm, new_shape = calc_fuse_perm_and_shape(shape, axes_groups)
+
+    if perm is not None:
+        x = _transpose(x, perm)
+    if new_shape is not None:
+        x = _reshape(x, new_shape)
+
+    return x
 
 
 def ndim(array):
+    """The number of dimensions of an array."""
     try:
         return array.ndim
     except AttributeError:
         return len(array.shape)
 
 
+@compose
+def multiply_diagonal(x, v, axis, backend=None):
+    """Multiply v into x as if contracting in a diagonal matrix."""
+    newshape = tuple((-1 if i == axis else 1) for i in range(ndim(x)))
+    v_broadcast = do("reshape", v, newshape, like=backend)
+    return x * v_broadcast
+
+
+@compose
+def align_axes(*arrays, axes, backend=None):
+    """Prepare a set of arrays that should be contractible along ``axes``.
+
+    For example, block symmetric arrays need to have aligned sectors prior to
+    fusing.
+    """
+    # default implementation is nothing
+    return arrays
+
+
 # ------------- miscelleneous other backend agnostic functions -------------- #
 
+
 def iscomplex(x):
-    if infer_backend(x) == 'builtins':
+    """Does ``x`` have a complex dtype?"""
+    if infer_backend(x) == "builtins":
         return isinstance(x, complex)
-    return 'complex' in get_dtype_name(x)
+    return "complex" in get_dtype_name(x)
 
 
+@compose
 def norm_fro(x):
-    if isinstance(x, numpy.ndarray):
-        return norm_fro_dense(x.reshape(-1))
+    """The frobenius norm of an array."""
     try:
-        return do('linalg.norm', reshape(x, [-1]), 2)
+        return do("linalg.norm", reshape(x, (-1,)))
     except AttributeError:
-        return do('sum', do('multiply', do('conj', x), x)) ** 0.5
+        return do("sum", do("abs", x) ** 2) ** 0.5
+
+
+norm_fro.register("numpy", norm_fro_dense)
+
+
+@norm_fro.register("autograd")
+def norm_fro_autoray(x):
+    # seems to be bug with autograd's linalg.norm and complex numbers
+    # https://github.com/HIPS/autograd/issues/666
+    # so implement manually
+    return do("sum", do("abs", x) ** 2) ** 0.5
 
 
 def sensibly_scale(x):
     """Take an array and scale it *very* roughly such that random tensor
     networks consisting of such arrays do not have gigantic norms.
     """
-    return x / norm_fro(x)**(1.5 / ndim(x))
-
-
-def _unitize_qr(x):
-    """Perform isometrization using the QR decomposition.
-    """
-    fat = x.shape[0] < x.shape[1]
-    if fat:
-        x = transpose(x)
-
-    Q = do('linalg.qr', x)[0]
-    if fat:
-        Q = transpose(Q)
-
-    return Q
-
-
-def _unitize_svd(x):
-    fat = x.shape[0] < x.shape[1]
-    if fat:
-        x = transpose(x)
-
-    Q = do('linalg.svd', x)[0]
-    if fat:
-        Q = transpose(Q)
-
-    return Q
-
-
-def _unitize_exp(x):
-    r"""Perform isometrization using the using anti-symmetric matrix
-    exponentiation.
-
-    .. math::
-
-            U_A = \exp{A - A^\dagger}
-
-    If ``x`` is rectangular it is completed with zeros first.
-    """
-    m, n = x.shape
-    d = max(m, n)
-    x = do('pad', x, [[0, d - m], [0, d - n]], 'constant', constant_values=0.0)
-    expx = do('linalg.expm', x - dag(x))
-    return expx[:m, :n]
-
-
-def _unitize_modified_gram_schmidt(A):
-    """Perform isometrization explicitly using the modified Gram Schmidt
-    procedure.
-    """
-    m, n = A.shape
-
-    thin = m > n
-    if thin:
-        A = do('transpose', A)
-
-    Q = []
-    for j in range(0, min(m, n)):
-
-        q = A[j, :]
-        for i in range(0, j):
-            rij = do('tensordot', do('conj', Q[i]), q, 1)
-            q = q - rij * Q[i]
-
-        Q.append(q / do('linalg.norm', q, 2))
-
-    Q = do('stack', tuple(Q), axis=0, like=A)
-
-    if thin:
-        Q = do('transpose', Q)
-
-    return Q
-
-
-_UNITIZE_METHODS = {
-    'qr': _unitize_qr,
-    'svd': _unitize_svd,
-    'exp': _unitize_exp,
-    'mgs': _unitize_modified_gram_schmidt,
-}
-
-
-def unitize(x, method='qr'):
-    """Generate a isometric (or unitary if square) matrix from array ``x``.
-
-    Parameters
-    ----------
-    x : array
-        The matrix to generate the isometry from.
-    method : {'qr', 'exp', 'mgs'}, optional
-        The method used to generate the isometry. Note ``'qr'`` is the fastest
-        and most robust but, for example, some libraries cannot back-propagate
-        through it.
-    """
-    return _UNITIZE_METHODS[method](x)
+    return x / norm_fro(x) ** (1.5 / ndim(x))
 
 
 @njit
@@ -253,21 +321,27 @@ def find_diag_axes(x, atol=1e-12):
         return None
 
     backend = infer_backend(x)
+    zero = do("zeros", (), like=x)
 
     # use numba-accelerated version for numpy arrays
-    if backend == 'numpy':
+    if backend == "numpy":
         diag_axes = _numba_find_diag_axes(x, atol=atol)
         if diag_axes:
             # make it determinstic
             return min(diag_axes)
         return None
-    indxrs = do('indices', shape, like=backend)
+    indxrs = do("indices", shape, like=backend)
 
     for i, j in itertools.combinations(range(len(shape)), 2):
         if shape[i] != shape[j]:
             continue
-        if do('allclose', x[indxrs[i] != indxrs[j]], 0.0,
-              atol=atol, like=backend):
+        if do(
+            "allclose",
+            x[indxrs[i] != indxrs[j]],
+            zero,
+            atol=atol,
+            like=backend,
+        ):
             return (i, j)
     return None
 
@@ -349,21 +423,27 @@ def find_antidiag_axes(x, atol=1e-12):
     backend = infer_backend(x)
 
     # use numba-accelerated version for numpy arrays
-    if backend == 'numpy':
+    if backend == "numpy":
         antidiag_axes = _numba_find_antidiag_axes(x, atol=atol)
         if antidiag_axes:
             # make it determinstic
             return min(antidiag_axes)
         return None
 
-    indxrs = do('indices', shape, like=backend)
+    indxrs = do("indices", shape, like=backend)
+    zero = do("zeros", (), like=x)
 
     for i, j in itertools.combinations(range(len(shape)), 2):
         di, dj = shape[i], shape[j]
         if di != dj:
             continue
-        if do('allclose', x[indxrs[i] != dj - 1 - indxrs[j]], 0.0,
-              atol=atol, like=backend):
+        if do(
+            "allclose",
+            x[indxrs[i] != dj - 1 - indxrs[j]],
+            zero,
+            atol=atol,
+            like=backend,
+        ):
             return (i, j)
     return None
 
@@ -444,17 +524,20 @@ def find_columns(x, atol=1e-12):
     backend = infer_backend(x)
 
     # use numba-accelerated version for numpy arrays
-    if backend == 'numpy':
+    if backend == "numpy":
         columns_pairs = _numba_find_columns(x, atol)
         if columns_pairs:
             return min(columns_pairs)
         return None
 
-    indxrs = do('indices', shape, like=backend)
+    indxrs = do("indices", shape, like=backend)
+    zero = do("zeros", (), like=x)
 
     for i in range(len(shape)):
         for j in range(shape[i]):
-            if do('allclose', x[indxrs[i] != j], 0.0, atol=atol, like=backend):
+            if do(
+                "allclose", x[indxrs[i] != j], zero, atol=atol, like=backend
+            ):
                 return (i, j)
 
     return None
@@ -476,6 +559,8 @@ class PArray:
     --------
     PTensor
     """
+
+    __slots__ = ("_fn", "_params", "_data", "_shape", "_shape_fn_id")
 
     def __init__(self, fn, params, shape=None):
         self.fn = fn
@@ -530,4 +615,4 @@ class PArray:
         ``g(f(params))``.
         """
         f = self.fn
-        self.fn = compose(g, f)
+        self.fn = fn_compose(g, f)

@@ -1,79 +1,67 @@
-"""Core functions for manipulating quantum objects.
-"""
+"""Core functions for manipulating quantum objects."""
 
-import os
-import math
 import cmath
-import operator
-import itertools
+import concurrent.futures as cf
 import functools
+import itertools
+import math
+import os
 from numbers import Integral
 
+import numba
 import numpy as np
 import scipy.sparse as sp
+
 from .utils import partition_all
+
+try:
+    from math import prod
+except ImportError:
+    import operator
+
+    def prod(iterable):
+        return functools.reduce(operator.mul, iterable, 1)
 
 
 # --------------------------------------------------------------------------- #
 #                            Accelerated Functions                            #
 # --------------------------------------------------------------------------- #
 
-for env_var in ['QUIMB_NUM_THREAD_WORKERS',
-                'QUIMB_NUM_PROCS',
-                'OMP_NUM_THREADS']:
+for env_var in [
+    "QUIMB_NUM_THREAD_WORKERS",
+    "QUIMB_NUM_PROCS",
+    "OMP_NUM_THREADS",
+]:
     if env_var in os.environ:
         _NUM_THREAD_WORKERS = int(os.environ[env_var])
         break
 else:
     import psutil
+
     _NUM_THREAD_WORKERS = psutil.cpu_count(logical=False)
 
-if ('NUMBA_NUM_THREADS' in os.environ):
-    if int(os.environ['NUMBA_NUM_THREADS']) != _NUM_THREAD_WORKERS:
-        import warnings
-        warnings.warn(
-            "'NUMBA_NUM_THREADS' has been set elsewhere and doesn't match the "
-            "value 'quimb' has tried to set - "
-            f"{os.environ['NUMBA_NUM_THREADS']} vs {_NUM_THREAD_WORKERS}.")
-else:
-    os.environ['NUMBA_NUM_THREADS'] = str(_NUM_THREAD_WORKERS)
-
-# need to set NUMBA_NUM_THREADS first
-import numba  # noqa
 
 _NUMBA_CACHE = {
-    'TRUE': True, 'ON': True, 'FALSE': False, 'OFF': False,
-}[os.environ.get('QUIMB_NUMBA_CACHE', 'True').upper()]
-_NUMBA_PAR = {
-    'TRUE': True, 'ON': True, 'FALSE': False, 'OFF': False,
-}[os.environ.get('QUIMB_NUMBA_PARALLEL', 'True').upper()]
+    "TRUE": True,
+    "ON": True,
+    "FALSE": False,
+    "OFF": False,
+}[os.environ.get("QUIMB_NUMBA_CACHE", "True").upper()]
 
 njit = functools.partial(numba.njit, cache=_NUMBA_CACHE)
 """Numba no-python jit, but obeying cache setting.
-"""
-
-pnjit = functools.partial(numba.njit, cache=_NUMBA_CACHE, parallel=_NUMBA_PAR)
-"""Numba no-python jit, but obeying cache setting, with optional parallel
-target, depending on environment variable 'QUIMB_NUMBA_PARALLEL'.
 """
 
 vectorize = functools.partial(numba.vectorize, cache=_NUMBA_CACHE)
 """Numba vectorize, but obeying cache setting.
 """
 
-pvectorize = functools.partial(numba.vectorize, cache=_NUMBA_CACHE,
-                               target='parallel' if _NUMBA_PAR else 'cpu')
-"""Numba vectorize, but obeying cache setting, with optional parallel
-target, depending on environment variable 'QUIMB_NUMBA_PARALLEL'.
-"""
-
 
 class CacheThreadPool(object):
-    """
-    """
+    """ """
 
     def __init__(self, func):
-        self._settings = '__UNINITIALIZED__'
+        self._settings = "__UNINITIALIZED__"
         self._pool_fn = func
 
     def __call__(self, num_threads=None):
@@ -81,7 +69,7 @@ class CacheThreadPool(object):
         if num_threads is None:
             num_threads = _NUM_THREAD_WORKERS
         # first call
-        if self._settings == '__UNINITIALIZED__':
+        if self._settings == "__UNINITIALIZED__":
             self._pool = self._pool_fn(num_threads)
             self._settings = num_threads
         # new type of pool requested
@@ -95,10 +83,11 @@ class CacheThreadPool(object):
 @CacheThreadPool
 def get_thread_pool(num_workers=None):
     from concurrent.futures import ThreadPoolExecutor
+
     return ThreadPoolExecutor(num_workers)
 
 
-def par_reduce(fn, seq, nthreads=_NUM_THREAD_WORKERS):
+def par_reduce(fn, seq, num_threads=_NUM_THREAD_WORKERS):
     """Parallel reduce.
 
     Parameters
@@ -107,7 +96,7 @@ def par_reduce(fn, seq, nthreads=_NUM_THREAD_WORKERS):
         Two argument function to reduce with.
     seq : sequence
         Sequence to reduce.
-    nthreads : int, optional
+    num_threads : int, optional
         The number of threads to reduce with in parallel.
 
     Returns
@@ -118,10 +107,10 @@ def par_reduce(fn, seq, nthreads=_NUM_THREAD_WORKERS):
     -----
     This has a several hundred microsecond overhead.
     """
-    if nthreads == 1:
+    if num_threads == 1:
         return functools.reduce(fn, seq)
 
-    pool = get_thread_pool(nthreads)  # cached
+    pool = get_thread_pool(num_threads)  # cached
 
     def _sfn(x):
         """Single call of `fn`, but accounts for the fact
@@ -146,12 +135,6 @@ def par_reduce(fn, seq, nthreads=_NUM_THREAD_WORKERS):
     return _inner_preduce(tuple(seq))
 
 
-def prod(xs):
-    """Product (as in multiplication) of an iterable.
-    """
-    return functools.reduce(operator.mul, xs, 1)
-
-
 def make_immutable(mat):
     """Make array read only, in-place.
 
@@ -162,14 +145,46 @@ def make_immutable(mat):
     """
     if issparse(mat):
         mat.data.flags.writeable = False
-        if mat.format in {'csr', 'csc', 'bsr'}:
+        if mat.format in {"csr", "csc", "bsr"}:
             mat.indices.flags.writeable = False
             mat.indptr.flags.writeable = False
-        elif mat.format == 'coo':
+        elif mat.format == "coo":
             mat.row.flags.writeable = False
             mat.col.flags.writeable = False
     else:
         mat.flags.writeable = False
+
+
+def isclose_qarray(a, b, **kwargs):
+    """Check if two qarrays are close. This is a simple wrapper around the
+    base numpy function, but ensures that the arrays are converted to standard
+    numpy arrays first, to avoid a call to the overridden `__and__` method.
+
+    Parameters
+    ----------
+    a : qarray
+        First array.
+    b : qarray
+        Second array.
+    rtol : array_like
+        The relative tolerance parameter.
+    atol : array_like
+        The absolute tolerance parameter (see Notes).
+    equal_nan: bool
+        Whether to compare NaN's as equal. If True, NaN's in a will be
+        considered equal to NaN's in b in the output array.
+
+    Returns
+    -------
+    bool
+    """
+    # numpy 2+ uses `&` so we convert arrays to standard ndarray first
+    return np.allclose(np.asarray(a), np.asarray(b), **kwargs)
+
+
+_numpy_qarray_overrides = {
+    np.isclose: isclose_qarray,
+}
 
 
 class qarray(np.ndarray):
@@ -188,6 +203,9 @@ class qarray(np.ndarray):
             return self.conjugate().transpose()
         else:
             return self.transpose()
+
+    def toarray(self):
+        return np.asarray(self)
 
     @property
     def A(self):
@@ -217,6 +235,13 @@ class qarray(np.ndarray):
     def ptr(self, dims, keep):
         return partial_trace(self, dims, keep)
 
+    def __array_function__(self, func, types, args, kwargs):
+        if func not in _numpy_qarray_overrides:
+            # avoid infinite recursion
+            return super().__array_function__(func, types, args, kwargs)
+
+        return _numpy_qarray_overrides[func](*args, **kwargs)
+
     def __str__(self):
         current_printopts = np.get_printoptions()
         np.set_printoptions(precision=6, linewidth=120)
@@ -231,14 +256,14 @@ class qarray(np.ndarray):
         np.set_printoptions(**current_printopts)
         return s
 
+
 # --------------------------------------------------------------------------- #
 # Decorators for standardizing output                                         #
 # --------------------------------------------------------------------------- #
 
 
 def ensure_qarray(fn):
-    """Decorator that wraps output as a ``qarray``.
-    """
+    """Decorator that wraps output as a ``qarray``."""
 
     @functools.wraps(fn)
     def qarray_fn(*args, **kwargs):
@@ -258,8 +283,8 @@ def realify_scalar(x, imag_tol=1e-12):
 
 
 def realify(fn, imag_tol=1e-12):
-    """Decorator that drops ``fn``'s output imaginary part if very small.
-    """
+    """Decorator that drops ``fn``'s output imaginary part if very small."""
+
     @functools.wraps(fn)
     def realified_fn(*args, **kwargs):
         return realify_scalar(fn(*args, **kwargs), imag_tol=imag_tol)
@@ -268,28 +293,28 @@ def realify(fn, imag_tol=1e-12):
 
 
 def zeroify(fn, tol=1e-14):
-    """Decorator that rounds ``fn``'s output to zero if very small.
-    """
+    """Decorator that rounds ``fn``'s output to zero if very small."""
+
     @functools.wraps(fn)
     def zeroified_f(*args, **kwargs):
         x = fn(*args, **kwargs)
         return 0.0 if abs(x) < tol else x
+
     return zeroified_f
 
 
-_COMPLEX_DTYPES = {'complex64', 'complex128'}
-_DOUBLE_DTYPES = {'float64', 'complex128'}
+_COMPLEX_DTYPES = {"complex64", "complex128"}
+_DOUBLE_DTYPES = {"float64", "complex128"}
 _DTYPE_MAP = {
-    (False, False): 'float32',
-    (False, True): 'float64',
-    (True, False): 'complex64',
-    (True, True): 'complex128',
+    (False, False): "float32",
+    (False, True): "float64",
+    (True, False): "complex64",
+    (True, True): "complex128",
 }
 
 
 def common_type(*arrays):
-    """Quick compute the minimal dtype sufficient for ``arrays``.
-    """
+    """Quick compute the minimal dtype sufficient for ``arrays``."""
     dtypes = {array.dtype.name for array in arrays}
     has_complex = not _COMPLEX_DTYPES.isdisjoint(dtypes)
     has_double = not _DOUBLE_DTYPES.isdisjoint(dtypes)
@@ -297,8 +322,8 @@ def common_type(*arrays):
 
 
 def upcast(fn):
-    """Decorator to make sure the types of two numpy arguments match.
-    """
+    """Decorator to make sure the types of two numpy arguments match."""
+
     def upcasted_fn(a, b):
         if a.dtype == b.dtype:
             return fn(a, b)
@@ -313,9 +338,9 @@ def upcast(fn):
 # Type and shape checks                                                       #
 # --------------------------------------------------------------------------- #
 
+
 def dag(qob):
-    """Conjugate transpose.
-    """
+    """Conjugate transpose."""
     try:
         return qob.H
     except AttributeError:
@@ -323,46 +348,39 @@ def dag(qob):
 
 
 def isket(qob):
-    """Checks if ``qob`` is in ket form -- an array column.
-    """
+    """Checks if ``qob`` is in ket form -- an array column."""
     return qob.shape[0] > 1 and qob.shape[1] == 1  # Column vector check
 
 
 def isbra(qob):
-    """Checks if ``qob`` is in bra form -- an array row.
-    """
+    """Checks if ``qob`` is in bra form -- an array row."""
     return qob.shape[0] == 1 and qob.shape[1] > 1  # Row vector check
 
 
 def isop(qob):
-    """Checks if ``qob`` is an operator.
-    """
+    """Checks if ``qob`` is an operator."""
     s = qob.shape
     return len(s) == 2 and (s[0] > 1) and (s[1] > 1)
 
 
 def isvec(qob):
-    """Checks if ``qob`` is row-vector, column-vector or one-dimensional.
-    """
+    """Checks if ``qob`` is row-vector, column-vector or one-dimensional."""
     shp = qob.shape
     return len(shp) == 1 or (len(shp) == 2 and (shp[0] == 1 or shp[1] == 1))
 
 
 def issparse(qob):
-    """Checks if ``qob`` is explicitly sparse.
-    """
+    """Checks if ``qob`` is explicitly sparse."""
     return isinstance(qob, sp.spmatrix)
 
 
 def isdense(qob):
-    """Checks if ``qob`` is explicitly dense.
-    """
+    """Checks if ``qob`` is explicitly dense."""
     return isinstance(qob, np.ndarray)
 
 
 def isreal(qob, **allclose_opts):
-    """Checks if ``qob`` is approximately real.
-    """
+    """Checks if ``qob`` is approximately real."""
     data = qob.data if issparse(qob) else qob
 
     # check dtype
@@ -374,7 +392,6 @@ def isreal(qob, **allclose_opts):
 
 
 def allclose_sparse(A, B, **allclose_opts):
-
     if A.shape != B.shape:
         return False
 
@@ -431,29 +448,170 @@ def ispos(qob, tol=1e-15):
 # --------------------------------------------------------------------------- #
 
 
-def _nb_complex_base(real, imag):  # pragma: no cover
-    return real + 1j * imag
+@njit(nogil=True)
+def threading_choose_num_blocks(size_total, target_block_size, num_threads):
+    """Given `size_total` items, `target_block_size`, and number of threads
+    `num_threads`, choose the number of blocks to split `size_total` into, the
+    base block size, and the remainder, used with `threading_get_block_range`.
 
+    Parameters
+    ----------
+    size_total : int
+        Total number of items to split.
+    target_block_size : int
+        Target block size. If positive, blocks will be at least this size. If
+        negative, blocks will be close to this size.
+    num_threads : int
+        Number of threads to split into.
 
-_cmplx_sigs = ['complex64(float32, float32)', 'complex128(float64, float64)']
-_nb_complex_seq = vectorize(_cmplx_sigs)(_nb_complex_base)
-_nb_complex_par = pvectorize(_cmplx_sigs)(_nb_complex_base)
-
-
-def complex_array(real, imag):
-    """Accelerated creation of complex array.
+    Returns
+    -------
+    int, int, int
+        Number of blocks, base block size, and block remainder.
     """
-    if real.size > 50000:
-        return _nb_complex_par(real, imag)
-    return _nb_complex_seq(real, imag)
+    if num_threads == 1:
+        # always just 1 block for single thread
+        num_blocks = 1
+
+    elif target_block_size < 0:
+        # target blocks actually close to size target_block_size, for
+        # cyclically distributing work with potentially varying costs
+        target_block_size = -target_block_size
+        num_blocks = np.ceil(size_total / target_block_size)
+        if num_blocks > num_threads:
+            # round to nearest multiple of num_threads
+            num_blocks = num_threads * round(num_blocks / num_threads)
+
+    else:
+        # target blocks at least as big as target_block_size
+        num_blocks = min(num_threads, round(size_total / num_threads))
+
+    base_block_size, block_remainder = divmod(size_total, num_blocks)
+    return num_blocks, base_block_size, block_remainder
+
+
+@njit(nogil=True)
+def threading_get_block_range(b, base_block_size, block_remainder):
+    """Given block index `b`, base block size `base_block_size`, and remainder
+    `block_remainder`, return the start and stop indices of the block.
+    """
+    start = b * base_block_size + min(b, block_remainder)
+    block_size = base_block_size + (1 if b < block_remainder else 0)
+    stop = start + block_size
+    return start, stop
+
+
+def maybe_multithread(
+    fn, *args, size_total, target_block_size, num_threads, **kwargs
+):
+    """Based on the size of the problem, either call `fn` directly or
+    get a pool and multithread it.
+    """
+    if size_total <= target_block_size:
+        # don't bother getting pool
+        fn(*args, **kwargs)
+    else:
+        if num_threads is None:
+            # get default number of threads
+            num_threads = _NUM_THREAD_WORKERS
+        pool = get_thread_pool(num_threads)
+
+        cf.wait(
+            pool.submit(
+                fn,
+                *args,
+                thread_rank=thread_rank,
+                num_threads=num_threads,
+                target_block_size=target_block_size,
+                **kwargs,
+            )
+            for thread_rank in range(num_threads)
+        )
+
+
+@njit(nogil=True)
+def _complex_array_numba(
+    x, y, out, thread_rank=0, num_threads=1, target_block_size=2**15
+):  # pragma: no cover
+    N = x.size
+
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            out[i] = complex(x[i], y[i])
+
+
+def complex_array(x, y, num_threads=None, target_block_size=2**15):
+    """Accelerated creation of complex array."""
+    if x.dtype == "float32":
+        dtype = "complex64"
+    else:
+        dtype = "complex128"
+
+    N = x.size
+    out = np.empty(N, dtype=dtype)
+
+    maybe_multithread(
+        _complex_array_numba,
+        x,
+        y,
+        out,
+        size_total=N,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
+    return out
+
+
+@njit(nogil=True)
+def _phase_to_complex_numba(
+    x, out, thread_rank=0, num_threads=1, target_block_size=2**10
+):  # pragma: no cover
+    N = x.size
+
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            xi = x[i]
+            out[i] = complex(np.cos(xi), np.sin(xi))
+
+
+def phase_to_complex(x, num_threads=None, target_block_size=2**10):
+    """Convert an array of phases to actual complex numbers."""
+    if x.dtype == "float32":
+        dtype = "complex64"
+    else:
+        dtype = "complex128"
+
+    N = x.size
+    out = np.empty(N, dtype=dtype)
+    maybe_multithread(
+        _phase_to_complex_numba,
+        x.ravel(),
+        out,
+        size_total=N,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
+    out.shape = x.shape
+    return out
 
 
 @ensure_qarray
 @upcast
 @njit
 def mul_dense(x, y):  # pragma: no cover
-    """Numba-accelerated element-wise multiplication of two dense matrices.
-    """
+    """Numba-accelerated element-wise multiplication of two dense matrices."""
     return x * y
 
 
@@ -482,61 +640,143 @@ def mul(x, y):
     return mul_dense(x, y)
 
 
-def _nb_subtract_update_base(X, c, Z):  # pragma: no cover
-    return X - c * Z
+@njit(nogil=True)
+def _subtract_update_2d_numba(
+    X, c, Y, thread_rank=0, num_threads=1, target_block_size=2**14
+):  # pragma: no cover
+    N, M = X.shape
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            for j in range(M):
+                X[i, j] -= c * Y[i, j]
 
 
-_sbtrct_sigs = ['float32(float32, float32, float32)',
-                'float32(float32, float64, float32)',
-                'float64(float64, float64, float64)',
-                'complex64(complex64, float32, complex64)',
-                'complex64(complex64, float64, complex64)',
-                'complex128(complex128, float64, complex128)']
-_nb_subtract_update_seq = vectorize(_sbtrct_sigs)(_nb_subtract_update_base)
-_nb_subtract_update_par = pvectorize(_sbtrct_sigs)(_nb_subtract_update_base)
+@njit(nogil=True)
+def _subtract_update_1d_numba(
+    X, c, Y, thread_rank=0, num_threads=1, target_block_size=2**14
+):  # pragma: no cover
+    (N,) = X.shape
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            X[i] -= c * Y[i]
 
 
-def subtract_update_(X, c, Y):
+def subtract_update_(X, c, Y, num_threads=None, target_block_size=2**14):
     """Accelerated inplace computation of ``X -= c * Y``. This is mainly
     for Lanczos iteration.
     """
-    if X.size > 2048:
-        _nb_subtract_update_par(X, c, Y, out=X)
+    if X.ndim == 2:
+        fn = _subtract_update_2d_numba
     else:
-        _nb_subtract_update_seq(X, c, Y, out=X)
+        fn = _subtract_update_1d_numba
+
+    maybe_multithread(
+        fn,
+        X,
+        c,
+        Y,
+        size_total=X.shape[0],
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
 
 
-def _nb_divide_update_base(X, c):  # pragma: no cover
-    return X / c
+@njit(nogil=True)
+def _divide_update_2d_numba(
+    X, c, out, thread_rank=0, num_threads=1, target_block_size=2**14
+):  # pragma: no cover
+    N, M = X.shape
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            for j in range(M):
+                out[i, j] = X[i, j] / c
 
 
-_divd_sigs = ['float32(float32, float32)',
-              'float64(float64, float64)',
-              'complex64(complex64, float32)',
-              'complex128(complex128, float64)']
-_nb_divide_update_seq = vectorize(_divd_sigs)(_nb_divide_update_base)
-_nb_divide_update_par = pvectorize(_divd_sigs)(_nb_divide_update_base)
+@njit(nogil=True)
+def _divide_update_1d_numba(
+    X, c, out, thread_rank=0, num_threads=1, target_block_size=2**14
+):  # pragma: no cover
+    (N,) = X.shape
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            out[i] = X[i] / c
 
 
-def divide_update_(X, c, out):
-    """Accelerated computation of ``X / c`` into ``out``.
-    """
-    if X.size > 2048:
-        _nb_divide_update_par(X, c, out=out)
+def divide_update_(X, c, out, num_threads=None, target_block_size=2**14):
+    """Accelerated computation of ``X / c`` into ``out``."""
+    if X.ndim == 2:
+        fn = _divide_update_2d_numba
     else:
-        _nb_divide_update_seq(X, c, out=out)
+        fn = _divide_update_1d_numba
+
+    maybe_multithread(
+        fn,
+        X,
+        c,
+        out,
+        size_total=X.shape[0],
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
 
 
-@pnjit  # pragma: no cover
-def _dot_csr_matvec_prange(data, indptr, indices, vec, out):
-    for i in numba.prange(vec.size):
-        isum = 0.0
-        for j in range(indptr[i], indptr[i + 1]):
-            isum += data[j] * vec[indices[j]]
-        out[i] = isum
+@njit(nogil=True)  # pragma: no cover
+def _dot_csr_matvec_numba(
+    data,
+    indptr,
+    indices,
+    vec,
+    out,
+    thread_rank=0,
+    num_threads=1,
+    target_block_size=-1024,
+):
+    N = vec.size
+
+    # this thread processes every num_threads'th block: the logic here is you
+    # want to process a large enough block of contiguous rows to make the
+    # memory access efficient, but also cyclically distribute the rows which
+    # may have varying sparsity on a larger scale
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+
+        for i in range(istart, istop):
+            isum = 0.0
+            for j in range(indptr[i], indptr[i + 1]):
+                isum += data[j] * vec[indices[j]]
+            out[i] = isum
 
 
-def par_dot_csr_matvec(A, x):
+def par_dot_csr_matvec(A, x, target_block_size=-1024, num_threads=None):
     """Parallel sparse csr-matrix vector dot product.
 
     Parameters
@@ -545,6 +785,11 @@ def par_dot_csr_matvec(A, x):
         Operator.
     x : dense vector
         Vector.
+    target_block_size : int, optional
+        The target block size (number of rows) for each thread if parallel.
+    num_threads : int, optional
+        Number of threads to use. If None, will use the default number of
+        threads.
 
     Returns
     -------
@@ -557,7 +802,19 @@ def par_dot_csr_matvec(A, x):
     as such this function is only beneficial for pretty large matrices.
     """
     y = np.empty(x.size, common_type(A, x))
-    _dot_csr_matvec_prange(A.data, A.indptr, A.indices, x.ravel(), y)
+
+    maybe_multithread(
+        _dot_csr_matvec_numba,
+        A.data,
+        A.indptr,
+        A.indices,
+        x.ravel(),
+        y,
+        size_total=x.size,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
+
     y.shape = x.shape
     if isinstance(x, qarray):
         y = qarray(y)
@@ -565,8 +822,7 @@ def par_dot_csr_matvec(A, x):
 
 
 def dot_sparse(a, b):
-    """Dot product for sparse matrix, dispatching to parallel for v large nnz.
-    """
+    """Dot product for sparse matrix, dispatching to parallel for v large nnz."""
     out = a @ b
 
     if isdense(out) and (isinstance(b, qarray) or isinstance(a, qarray)):
@@ -618,23 +874,41 @@ def rdot(a, b):  # pragma: no cover
     return (a @ b).item()
 
 
-@pnjit
-def _l_diag_dot_dense_par(l, A, out):  # pragma: no cover
-    for i in numba.prange(l.size):
-        out[i, :] = l[i] * A[i, :]
+@njit(nogil=True)
+def _l_diag_dot_dense_par(
+    l, A, out, thread_rank=0, num_threads=1, target_block_size=128
+):  # pragma: no cover
+    N, M = A.shape
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            li = l[i]
+            for j in range(M):
+                out[i, j] = li * A[i, j]
 
 
 @ensure_qarray
-def l_diag_dot_dense(diag, mat):
+def l_diag_dot_dense(diag, mat, num_threads=None, target_block_size=128):
     """Dot product of diagonal matrix (with only diagonal supplied) and dense
     matrix.
     """
+    diag = diag.ravel()
+    out = np.empty_like(mat, dtype=common_type(diag, mat))
 
-    if diag.size <= 128:
-        return mul_dense(diag.reshape(-1, 1), mat)
-    else:
-        out = np.empty_like(mat, dtype=common_type(diag, mat))
-        _l_diag_dot_dense_par(diag.ravel(), mat, out)
+    maybe_multithread(
+        _l_diag_dot_dense_par,
+        diag,
+        mat,
+        out,
+        size_total=diag.size,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
 
     return out
 
@@ -667,23 +941,39 @@ def ldmul(diag, mat):
     return l_diag_dot_dense(diag, mat)
 
 
-@pnjit
-def _r_diag_dot_dense_par(A, l, out):  # pragma: no cover
-    for i in numba.prange(l.size):
-        out[:, i] = A[:, i] * l[i]
+@njit(nogil=True)
+def _r_diag_dot_dense_par(
+    A, l, out, thread_rank=0, num_threads=1, target_block_size=128
+):  # pragma: no cover
+    N, M = A.shape
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            for j in range(M):
+                out[i, j] = A[i, j] * l[j]
 
 
 @ensure_qarray
-def r_diag_dot_dense(mat, diag):
+def r_diag_dot_dense(mat, diag, num_threads=None, target_block_size=128):
     """Dot product of dense matrix and digonal matrix (with only diagonal
     supplied).
     """
-    if diag.size <= 128:
-        return mul_dense(mat, diag.reshape(1, -1))
-    else:
-        out = np.empty_like(mat, dtype=common_type(diag, mat))
-        _r_diag_dot_dense_par(mat, diag.ravel(), out)
-
+    diag = diag.ravel()
+    out = np.empty_like(mat, dtype=common_type(diag, mat))
+    maybe_multithread(
+        _r_diag_dot_dense_par,
+        mat,
+        diag,
+        out,
+        size_total=diag.size,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
     return out
 
 
@@ -716,31 +1006,47 @@ def rdmul(mat, diag):
     return r_diag_dot_dense(mat, diag)
 
 
-@pnjit
-def _outer_par(a, b, out, m, n):  # pragma: no cover
-    for i in numba.prange(m):
-        out[i, :] = a[i] * b[:]
+@njit(nogil=True)
+def _outer_par(
+    x, y, out, m, n, thread_rank=0, num_threads=1, target_block_size=128
+):  # pragma: no cover
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        m, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+
+        for i in range(istart, istop):
+            for j in range(n):
+                out[i, j] = x[i] * y[j]
 
 
 @ensure_qarray
-def outer(a, b):
-    """Outer product between two vectors (no conjugation).
-    """
+def outer(a, b, num_threads=None, target_block_size=128):
+    """Outer product between two vectors (no conjugation)."""
+    a = a.ravel()
+    b = b.ravel()
     m, n = a.size, b.size
-
-    if m * n < 2**14:
-        return mul_dense(a.reshape(m, 1), b.reshape(1, n))
-
     out = np.empty((m, n), dtype=common_type(a, b))
-    _outer_par(a.ravel(), b.ravel(), out, m, n)
-
+    maybe_multithread(
+        _outer_par,
+        a,
+        b,
+        out,
+        m,
+        n,
+        size_total=m,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
     return out
 
 
 @vectorize
 def explt(l, t):  # pragma: no cover
-    """Complex exponenital as used in solution to schrodinger equation.
-    """
+    """Complex exponenital as used in solution to schrodinger equation."""
     return cmath.exp((-1.0j * t) * l)
 
 
@@ -749,36 +1055,55 @@ def explt(l, t):  # pragma: no cover
 # --------------------------------------------------------------------------- #
 
 
-@njit
-def _nb_kron_exp_seq(a, b, out, m, n, p, q):  # pragma: no cover
-    for i in range(m):
-        for j in range(n):
-            ii, fi = i * p, (i + 1) * p
-            ij, fj = j * q, (j + 1) * q
-            out[ii:fi, ij:fj] = a[i, j] * b
-
-
-@pnjit
-def _nb_kron_exp_par(a, b, out, m, n, p, q):  # pragma: no cover
-    for i in numba.prange(m):
-        for j in range(n):
-            ii, fi = i * p, (i + 1) * p
-            ij, fj = j * q, (j + 1) * q
-            out[ii:fi, ij:fj] = a[i, j] * b
+@njit(nogil=True)
+def _kron_dense_numba(
+    x,
+    y,
+    out,
+    m,
+    n,
+    p,
+    q,
+    thread_rank=0,
+    num_threads=1,
+    target_block_size=128,
+):  # pragma: no cover
+    N = m * p
+    num_blocks, base_block_size, block_remainder = threading_choose_num_blocks(
+        N, target_block_size, num_threads
+    )
+    for b in range(thread_rank, num_blocks, num_threads):
+        istart, istop = threading_get_block_range(
+            b, base_block_size, block_remainder
+        )
+        for i in range(istart, istop):
+            ia, ib = divmod(i, p)
+            i = p * ia + ib
+            for ja in range(n):
+                aij = x[ia, ja]
+                for jb in range(q):
+                    j = q * ja + jb
+                    out[i, j] = aij * y[ib, jb]
 
 
 @ensure_qarray
-def kron_dense(a, b, par_thresh=4096):
+def kron_dense(a, b, num_threads=None, target_block_size=128):
     m, n = a.shape
     p, q = b.shape
-
     out = np.empty((m * p, n * q), dtype=common_type(a, b))
-
-    if out.size > 4096:
-        _nb_kron_exp_par(a, b, out, m, n, p, q)
-    else:
-        _nb_kron_exp_seq(a, b, out, m, n, p, q)
-
+    maybe_multithread(
+        _kron_dense_numba,
+        a,
+        b,
+        out,
+        m,
+        n,
+        p,
+        q,
+        size_total=m * p,
+        target_block_size=target_block_size,
+        num_threads=num_threads,
+    )
     return out
 
 
@@ -788,10 +1113,15 @@ def kron_sparse(a, b, stype=None):
     Output format can be specified or will be automatically determined.
     """
     if stype is None:
-        stype = ("bsr" if isinstance(b, np.ndarray) or b.format == 'bsr' else
-                 b.format if isinstance(a, np.ndarray) else
-                 "csc" if a.format == "csc" and b.format == "csc" else
-                 "csr")
+        stype = (
+            "bsr"
+            if isinstance(b, np.ndarray) or b.format == "bsr"
+            else b.format
+            if isinstance(a, np.ndarray)
+            else "csc"
+            if a.format == "csc" and b.format == "csc"
+            else "csr"
+        )
 
     return sp.kron(a, b, format=stype)
 
@@ -810,10 +1140,12 @@ def kron_dispatch(a, b, stype=None):
 #                                Core Functions                               #
 # --------------------------------------------------------------------------- #
 
-_SPARSE_CONSTRUCTORS = {"csr": sp.csr_matrix,
-                        "bsr": sp.bsr_matrix,
-                        "csc": sp.csc_matrix,
-                        "coo": sp.coo_matrix}
+_SPARSE_CONSTRUCTORS = {
+    "csr": sp.csr_matrix,
+    "bsr": sp.bsr_matrix,
+    "csc": sp.csc_matrix,
+    "coo": sp.coo_matrix,
+}
 
 
 def sparse_matrix(data, stype="csr", dtype=complex):
@@ -836,11 +1168,11 @@ def sparse_matrix(data, stype="csr", dtype=complex):
 
 _EXPEC_METHODS = {
     # [isop(a), isop(b), issparse(a) or issparse(b)]
-    (0, 0, 0): lambda a, b: abs(vdot(a, b))**2,
+    (0, 0, 0): lambda a, b: abs(vdot(a, b)) ** 2,
     (0, 1, 0): lambda a, b: vdot(a, b @ a),
     (1, 0, 0): lambda a, b: vdot(b, a @ b),
     (1, 1, 0): lambda a, b: _trace_dense(a @ b),
-    (0, 0, 1): lambda a, b: abs(dot(dag(a), b)[0, 0])**2,
+    (0, 0, 1): lambda a, b: abs(dot(dag(a), b)[0, 0]) ** 2,
     (0, 1, 1): realify(lambda a, b: dot(dag(a), dot(b, a))[0, 0]),
     (1, 0, 1): realify(lambda a, b: dot(dag(b), dot(a, b))[0, 0]),
     (1, 1, 1): lambda a, b: _trace_sparse(dot(a, b)),
@@ -902,7 +1234,7 @@ def normalize(qob, inplace=True):
     if isop(qob):
         n_factor = trace(qob)
     else:
-        n_factor = expectation(qob, qob)**0.25
+        n_factor = expectation(qob, qob) ** 0.25
 
     qob[:] /= n_factor
     return qob
@@ -944,8 +1276,15 @@ def chop(qob, tol=1.0e-15, inplace=True):
 chop_ = functools.partial(chop, inplace=True)
 
 
-def quimbify(data, qtype=None, normalized=False, chopped=False,
-             sparse=None, stype=None, dtype=complex):
+def quimbify(
+    data,
+    qtype=None,
+    normalized=False,
+    chopped=False,
+    sparse=None,
+    stype=None,
+    dtype=complex,
+):
     """Converts data to 'quantum' i.e. complex matrices, kets being columns.
 
     Parameters
@@ -1006,20 +1345,22 @@ def quimbify(data, qtype=None, normalized=False, chopped=False,
     """
 
     sparse_input = issparse(data)
-    sparse_output = ((sparse) or
-                     (sparse_input and sparse is None) or
-                     (sparse is None and stype))
+    sparse_output = (
+        (sparse)
+        or (sparse_input and sparse is None)
+        or (sparse is None and stype)
+    )
     # Infer output sparse format from input if necessary
     if sparse_input and sparse_output and stype is None:
         stype = data.format
 
     if (qtype is None) and (np.ndim(data) == 1):
         # assume quimbify simple list -> ket
-        qtype = 'ket'
+        qtype = "ket"
 
     if qtype is not None:
         # Must be dense to reshape
-        data = qarray(data.A if sparse_input else data)
+        data = qarray(data.toarray() if sparse_input else data)
         if qtype in ("k", "ket"):
             data = data.reshape((prod(data.shape), 1))
         elif qtype in ("b", "bra"):
@@ -1030,12 +1371,13 @@ def quimbify(data, qtype=None, normalized=False, chopped=False,
 
     # Just cast as qarray
     elif not sparse_output:
-        data = qarray(data.A if sparse_input else data, dtype=dtype)
+        data = qarray(data.toarray() if sparse_input else data, dtype=dtype)
 
     # Check if already sparse matrix, or wanted to be one
     if sparse_output:
-        data = sparse_matrix(data, dtype=dtype,
-                             stype=(stype if stype is not None else "csr"))
+        data = sparse_matrix(
+            data, dtype=dtype, stype=(stype if stype is not None else "csr")
+        )
 
     # Optionally normalize and chop small components
     if normalized:
@@ -1049,13 +1391,13 @@ def quimbify(data, qtype=None, normalized=False, chopped=False,
 qu = quimbify
 """Alias of :func:`quimbify`."""
 
-ket = functools.partial(quimbify, qtype='ket')
+ket = functools.partial(quimbify, qtype="ket")
 """Convert an object into a ket."""
 
-bra = functools.partial(quimbify, qtype='bra')
+bra = functools.partial(quimbify, qtype="bra")
 """Convert an object into a bra."""
 
-dop = functools.partial(quimbify, qtype='dop')
+dop = functools.partial(quimbify, qtype="dop")
 """Convert an object into a density operator."""
 
 sparse = functools.partial(quimbify, sparse=True)
@@ -1089,8 +1431,10 @@ def infer_size(p, base=2):
     sz = math.log(max(p.shape), base)
 
     if sz % 1 > 1e-13:
-        raise ValueError(f"This state does not seem to be composed of sites"
-                         "of equal size {base}.")
+        raise ValueError(
+            "This state does not seem to be composed "
+            f"of sites of equal size {base}."
+        )
 
     return int(sz)
 
@@ -1098,8 +1442,7 @@ def infer_size(p, base=2):
 @realify
 @njit
 def _trace_dense(op):  # pragma: no cover
-    """Trace of a dense operator.
-    """
+    """Trace of a dense operator."""
     x = 0.0
     for i in range(op.shape[0]):
         x += op[i, i]
@@ -1108,8 +1451,7 @@ def _trace_dense(op):  # pragma: no cover
 
 @realify
 def _trace_sparse(op):
-    """Trace of a sparse operator.
-    """
+    """Trace of a sparse operator."""
     return np.sum(op.diagonal())
 
 
@@ -1131,14 +1473,12 @@ def trace(mat):
 
 @ensure_qarray
 def _identity_dense(d, dtype=complex):
-    """Returns a dense, identity of given dimension ``d`` and type ``dtype``.
-    """
+    """Returns a dense, identity of given dimension ``d`` and type ``dtype``."""
     return np.eye(d, dtype=dtype)
 
 
 def _identity_sparse(d, stype="csr", dtype=complex):
-    """Returns a sparse, complex identity of order d.
-    """
+    """Returns a sparse, complex identity of order d."""
     return sp.eye(d, dtype=dtype, format=stype)
 
 
@@ -1173,8 +1513,7 @@ speye = functools.partial(identity, sparse=True)
 
 
 def _kron_core(*ops, stype=None, coo_build=False, parallel=False):
-    """Core kronecker product for a sequence of objects.
-    """
+    """Core kronecker product for a sequence of objects."""
     tmp_stype = "coo" if coo_build or stype == "coo" else None
     reducer = par_reduce if parallel else functools.reduce
     return reducer(functools.partial(kron_dispatch, stype=tmp_stype), ops)
@@ -1202,7 +1541,7 @@ def dynal(x, bases):
     >>> sum(d * b for d, b in zip(drep, bs_szs))
     3279
     """
-    bs_szs = [prod(bases[i + 1:]) for i in range(len(bases))]
+    bs_szs = [prod(bases[i + 1 :]) for i in range(len(bases))]
 
     for b in bs_szs:
         div = x // b
@@ -1287,7 +1626,7 @@ def kron(*ops, stype=None, coo_build=False, parallel=False, ownership=None):
     <256x1024 sparse matrix of type '<class 'numpy.complex128'>'
             with 13122 stored elements in Compressed Sparse Row format>
     """
-    core_kws = {'coo_build': coo_build, 'stype': stype, 'parallel': parallel}
+    core_kws = {"coo_build": coo_build, "stype": stype, "parallel": parallel}
 
     if ownership is None:
         X = _kron_core(*ops, **core_kws)
@@ -1296,7 +1635,7 @@ def kron(*ops, stype=None, coo_build=False, parallel=False, ownership=None):
         dims = [op.shape[0] for op in ops]
 
         D = prod(dims)
-        if not ((0 <= ri < D) and ((0 < rf <= D))):
+        if not ((0 <= ri < D) and (0 < rf <= D)):
             raise ValueError(f"Ownership ({ri}, {rf}) not in range [0-{D}].")
 
         matching_dyn = tuple(gen_matching_dynal(ri, rf - 1, dims))
@@ -1305,7 +1644,7 @@ def kron(*ops, stype=None, coo_build=False, parallel=False, ownership=None):
 
         # check if the kron has naturally oversliced
         if matching_dyn:
-            mtchn_bs = [prod(dims[i + 1:]) for i in range(len(matching_dyn))]
+            mtchn_bs = [prod(dims[i + 1 :]) for i in range(len(matching_dyn))]
             coeffs_bases = tuple(zip(mtchn_bs, matching_dyn))
             ri_got = sum(d * b[0] for d, b in coeffs_bases)
             rf_got = sum(d * b[1] for d, b in coeffs_bases) + mtchn_bs[-1]
@@ -1318,7 +1657,7 @@ def kron(*ops, stype=None, coo_build=False, parallel=False, ownership=None):
             # we can't slice 'coo' matrices -> convert to 'csr'
             if sp.isspmatrix_coo(X):
                 X = X.tocsr()
-            X = X[di:(None if df == 0 else df), :]
+            X = X[di : (None if df == 0 else df), :]
 
     if stype is not None:
         return X.asformat(stype)
@@ -1351,8 +1690,7 @@ def kronpow(a, p, **kron_opts):
 
 
 def _find_shape_of_nested_int_array(x):
-    """Take a n-nested list/tuple of integers and find its array shape.
-    """
+    """Take a n-nested list/tuple of integers and find its array shape."""
     shape = [len(x)]
     sub_x = x[0]
     while not np.issubdtype(type(sub_x), np.integer):
@@ -1410,12 +1748,14 @@ def _dim_map_nd(szs, coos, cyclic=False, trim=False):
     return (sum(c * m for c, m in zip(coo, strides)) for coo in coos)
 
 
-_dim_mapper_methods = {(1, False, False): _dim_map_1d,
-                       (1, False, True): _dim_map_1dtrim,
-                       (1, True, False): _dim_map_1dcyclic,
-                       (2, False, False): _dim_map_2d,
-                       (2, False, True): _dim_map_2dtrim,
-                       (2, True, False): _dim_map_2dcyclic}
+_dim_mapper_methods = {
+    (1, False, False): _dim_map_1d,
+    (1, False, True): _dim_map_1dtrim,
+    (1, True, False): _dim_map_1dcyclic,
+    (2, False, False): _dim_map_2d,
+    (2, False, True): _dim_map_2dtrim,
+    (2, True, False): _dim_map_2dcyclic,
+}
 
 
 def dim_map(dims, coos, cyclic=False, trim=False):
@@ -1530,9 +1870,13 @@ def _dim_compressor(dims, inds):  # pragma: no cover
                 yield (autoplace_count, 1)
                 autoplace_count = 0
             blocksize_id *= dim
-    yield ((blocksize_op, 1) if blocksize_op > 1 else
-           (blocksize_id, 0) if blocksize_id > 1 else
-           (autoplace_count, 1))
+    yield (
+        (blocksize_op, 1)
+        if blocksize_op > 1
+        else (blocksize_id, 0)
+        if blocksize_id > 1
+        else (autoplace_count, 1)
+    )
 
 
 def dim_compress(dims, inds):
@@ -1579,8 +1923,16 @@ def dim_compress(dims, inds):
     return dims, inds
 
 
-def ikron(ops, dims, inds, sparse=None, stype=None,
-          coo_build=False, parallel=False, ownership=None):
+def ikron(
+    ops,
+    dims,
+    inds,
+    sparse=None,
+    stype=None,
+    coo_build=False,
+    parallel=False,
+    ownership=None,
+):
     """Tensor an operator into a larger space by padding with identities.
 
     Automatically placing a large operator over several dimensions is allowed
@@ -1679,18 +2031,18 @@ def ikron(ops, dims, inds, sparse=None, stype=None,
     inds, ops = set(inds), iter(ops)
 
     # can't slice "coo" format so use "csr" if ownership specified
-    eye_kws = {'sparse': sparse,
-               'stype': "csr" if ownership else "coo",
-               'dtype': dtype}
+    eye_kws = {
+        "sparse": sparse,
+        "stype": "csr" if ownership else "coo",
+        "dtype": dtype,
+    }
 
     def gen_ops():
         cff_id = 1  # keeps track of compressing adjacent identities
         cff_ov = 1  # keeps track of overlaying op on multiple dimensions
         for ind, dim in enumerate(dims):
-
             # check if op should be placed here
             if ind in inds:
-
                 # check if need preceding identities
                 if cff_id > 1:
                     yield eye(cff_id, **eye_kws)
@@ -1721,30 +2073,33 @@ def ikron(ops, dims, inds, sparse=None, stype=None,
         if cff_id > 1:
             yield eye(cff_id, **eye_kws)
 
-    return kron(*gen_ops(), stype=stype, coo_build=coo_build,
-                parallel=parallel, ownership=ownership)
+    return kron(
+        *gen_ops(),
+        stype=stype,
+        coo_build=coo_build,
+        parallel=parallel,
+        ownership=ownership,
+    )
 
 
 @ensure_qarray
 def _permute_dense(p, dims, perm):
-    """Permute the subsytems of a dense array.
-    """
+    """Permute the subsytems of a dense array."""
     p, perm = np.asarray(p), np.asarray(perm)
     d = prod(dims)
 
     if isop(p):
-        return (p.reshape([*dims, *dims])
-                .transpose([*perm, *(perm + len(dims))])
-                .reshape([d, d]))
+        return (
+            p.reshape([*dims, *dims])
+            .transpose([*perm, *(perm + len(dims))])
+            .reshape([d, d])
+        )
 
-    return (p.reshape(dims)
-            .transpose(perm)
-            .reshape([d, 1]))
+    return p.reshape(dims).transpose(perm).reshape([d, 1])
 
 
 def _permute_sparse(a, dims, perm):
-    """Permute the subsytems of a sparse matrix.
-    """
+    """Permute the subsytems of a sparse matrix."""
     perm, dims = np.asarray(perm), np.asarray(dims)
 
     # New dimensions & stride (i.e. product of preceding dimensions)
@@ -1793,7 +2148,7 @@ def permute(p, dims, perm):
 
     >>> IX = speye(2) & pauli('X', sparse=True)
     >>> XI = permute(IX, dims=[2, 2], perm=[1, 0])
-    >>> np.allclose(XI.A, pauli('X') & eye(2))
+    >>> np.allclose(XI.toarray(), pauli('X') & eye(2))
     True
     """
     if issparse(p):
@@ -1869,7 +2224,8 @@ def pkron(op, dims, inds, **ikron_opts):
         inds_out, dims_out = (), ()
     else:
         inds_out, dims_out = zip(
-            *((i, x) for i, x in enumerate(dims) if i not in inds))
+            *((i, x) for i, x in enumerate(dims) if i not in inds)
+        )
 
     # current order and dimensions of system
     p = [*inds, *inds_out]
@@ -1883,8 +2239,7 @@ def pkron(op, dims, inds, **ikron_opts):
 
 
 def ind_complement(inds, n):
-    """Return the indices below ``n`` not contained in ``inds``.
-    """
+    """Return the indices below ``n`` not contained in ``inds``."""
     return tuple(i for i in range(n) if i not in inds)
 
 
@@ -1941,8 +2296,7 @@ def itrace(a, axes=(0, 1)):
 
 @ensure_qarray
 def _partial_trace_dense(p, dims, keep):
-    """Perform partial trace of a dense matrix.
-    """
+    """Perform partial trace of a dense matrix."""
     if isinstance(keep, Integral):
         keep = (keep,)
     if isvec(p):  # p = psi
@@ -1969,7 +2323,7 @@ def _trace_lose(p, dims, lose):
     dims = np.asarray(dims)
     e = dims[lose]
     a = prod(dims[:lose])
-    b = prod(dims[lose + 1:])
+    b = prod(dims[lose + 1 :])
     rhos = np.zeros(shape=(a * b, a * b), dtype=np.complex128)
     for i in range(a * b):
         for j in range(i, a * b):
@@ -1991,7 +2345,7 @@ def _trace_keep(p, dims, keep):
     dims = np.asarray(dims)
     s = dims[keep]
     a = prod(dims[:keep])
-    b = prod(dims[keep + 1:])
+    b = prod(dims[keep + 1 :])
     rhos = np.zeros(shape=(s, s), dtype=np.complex128)
     for i in range(s):
         for j in range(i, s):
@@ -2014,10 +2368,9 @@ def _partial_trace_simple(p, dims, keep):
     dims, keep = dim_compress(dims, keep)
     if len(keep) == 1:
         return _trace_keep(p, dims, *keep)
-    lmax = max(enumerate(dims),
-               key=lambda ix: (ix[0] not in keep) * ix[1])[0]
+    lmax = max(enumerate(dims), key=lambda ix: (ix[0] not in keep) * ix[1])[0]
     p = _trace_lose(p, dims, lmax)
-    dims = (*dims[:lmax], *dims[lmax + 1:])
+    dims = (*dims[:lmax], *dims[lmax + 1 :])
     keep = {(ind if ind < lmax else ind - 1) for ind in keep}
     return _partial_trace_simple(p, dims, keep)
 
@@ -2119,9 +2472,21 @@ sp.csc_matrix.__and__ = kron_dispatch
 sp.coo_matrix.__and__ = kron_dispatch
 
 
+if not hasattr(sp.csr_matrix, "H"):
+    # scipy >=1.14 removed the .H attribute
+
+    def sparse_hermitian_conjugate(self):
+        return self.conjugate().transpose()
+
+    sp.csr_matrix.H = property(sparse_hermitian_conjugate)
+    sp.csc_matrix.H = property(sparse_hermitian_conjugate)
+    sp.coo_matrix.H = property(sparse_hermitian_conjugate)
+    sp.bsr_matrix.H = property(sparse_hermitian_conjugate)
+
+
 def csr_mulvec_wrap(fn):
-    """Dispatch sparse csr-vector multiplication to parallel method.
-    """
+    """Dispatch sparse csr-vector multiplication to parallel method."""
+
     @functools.wraps(fn)
     def csr_mul_vector(A, x):
         if A.nnz > 50000 and _NUM_THREAD_WORKERS > 1:
@@ -2139,6 +2504,7 @@ def sp_mulvec_wrap(fn):
     """Scipy sparse doesn't call __array_finalize__ so need to explicitly
     make sure qarray input -> qarray output.
     """
+
     @functools.wraps(fn)
     def qarrayed_fn(self, other):
         out = fn(self, other)
@@ -2149,12 +2515,43 @@ def sp_mulvec_wrap(fn):
     return qarrayed_fn
 
 
-sp.csr_matrix._mul_vector = csr_mulvec_wrap(sp.csr_matrix._mul_vector)
-sp.csc_matrix._mul_vector = sp_mulvec_wrap(sp.csc_matrix._mul_vector)
-sp.coo_matrix._mul_vector = sp_mulvec_wrap(sp.coo_matrix._mul_vector)
-sp.bsr_matrix._mul_vector = sp_mulvec_wrap(sp.bsr_matrix._mul_vector)
+try:
+    # scipy>=1.13
+    sp.csr_matrix._matmul_vector = csr_mulvec_wrap(
+        sp.csr_matrix._matmul_vector
+    )
+    sp.csc_matrix._matmul_vector = sp_mulvec_wrap(sp.csc_matrix._matmul_vector)
+    sp.coo_matrix._matmul_vector = sp_mulvec_wrap(sp.coo_matrix._matmul_vector)
+    sp.bsr_matrix._matmul_vector = sp_mulvec_wrap(sp.bsr_matrix._matmul_vector)
 
-sp.csr_matrix._mul_multivector = sp_mulvec_wrap(sp.csr_matrix._mul_multivector)
-sp.csc_matrix._mul_multivector = sp_mulvec_wrap(sp.csc_matrix._mul_multivector)
-sp.coo_matrix._mul_multivector = sp_mulvec_wrap(sp.coo_matrix._mul_multivector)
-sp.bsr_matrix._mul_multivector = sp_mulvec_wrap(sp.bsr_matrix._mul_multivector)
+    sp.csr_matrix._matmul_multivector = sp_mulvec_wrap(
+        sp.csr_matrix._matmul_multivector
+    )
+    sp.csc_matrix._matmul_multivector = sp_mulvec_wrap(
+        sp.csc_matrix._matmul_multivector
+    )
+    sp.coo_matrix._matmul_multivector = sp_mulvec_wrap(
+        sp.coo_matrix._matmul_multivector
+    )
+    sp.bsr_matrix._matmul_multivector = sp_mulvec_wrap(
+        sp.bsr_matrix._matmul_multivector
+    )
+except AttributeError:
+    # scipy <=1.12"
+    sp.csr_matrix._mul_vector = csr_mulvec_wrap(sp.csr_matrix._mul_vector)
+    sp.csc_matrix._mul_vector = sp_mulvec_wrap(sp.csc_matrix._mul_vector)
+    sp.coo_matrix._mul_vector = sp_mulvec_wrap(sp.coo_matrix._mul_vector)
+    sp.bsr_matrix._mul_vector = sp_mulvec_wrap(sp.bsr_matrix._mul_vector)
+
+    sp.csr_matrix._mul_multivector = sp_mulvec_wrap(
+        sp.csr_matrix._mul_multivector
+    )
+    sp.csc_matrix._mul_multivector = sp_mulvec_wrap(
+        sp.csc_matrix._mul_multivector
+    )
+    sp.coo_matrix._mul_multivector = sp_mulvec_wrap(
+        sp.coo_matrix._mul_multivector
+    )
+    sp.bsr_matrix._mul_multivector = sp_mulvec_wrap(
+        sp.bsr_matrix._mul_multivector
+    )

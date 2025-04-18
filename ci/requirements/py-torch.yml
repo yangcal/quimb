@@ -1,0 +1,20 @@
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - autoray>=0.6.12
+  - cotengra>=0.7.1
+  - coverage
+  - cpuonly
+  - cytoolz
+  - joblib
+  - matplotlib
+  - networkx
+  - numba>=0.56
+  - numpy
+  - psutil
+  - pytest
+  - pytest-cov
+  - pytorch
+  - scipy<1.15.0
+  - tqdm

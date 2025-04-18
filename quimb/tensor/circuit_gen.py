@@ -1,14 +1,15 @@
+"""Functions for generating specific, e.g. ansatz, circuits."""
+
 import math
 import random
 import itertools
 
 from .. import rand, seed_rand
-from . import Circuit
 
 
 def inject_u3s(
     ent_gates,
-    gate2='cz',
+    gate2="cz",
     avoid_doubling=False,
     seed=None,
 ):
@@ -63,11 +64,10 @@ def inject_u3s(
     gates = []
     # consume list of pairs to entangle
     while ent_gates:
-
         # break up entanling gates with U3s where necesary
         for i in range(n):
             if needs_u3[i]:
-                gates.append(('U3', *rand(3, scale=2 * math.pi), i))
+                gates.append(("U3", *rand(3, scale=2 * math.pi), i))
                 needs_u3[i] = False
 
         # try and get the next entanling gate which is not 'doubled'
@@ -89,8 +89,7 @@ def inject_u3s(
         #  ^  ^  ^  ^
         if avoid_doubling:
             just_entangled = {
-                ij for ij in just_entangled
-                if (i not in ij) and (j not in ij)
+                ij for ij in just_entangled if (i not in ij) and (j not in ij)
             }
             just_entangled.add((i, j))
 
@@ -100,12 +99,12 @@ def inject_u3s(
     # place the final layer of U3s
     for i in range(n):
         if needs_u3[i]:
-            gates.append(('U3', *rand(3, scale=2 * math.pi), i))
+            gates.append(("U3", *rand(3, scale=2 * math.pi), i))
 
     return gates
 
 
-def gates_to_param_circuit(gates, n, parametrize='U3', **circuit_opts):
+def gates_to_param_circuit(gates, n, parametrize="U3", **circuit_opts):
     """Turn the sequence ``gates`` into a ``Circuit`` of ``n`` qubits, with any
     gates that appear in ``parametrize`` being... parametrized.
 
@@ -124,6 +123,8 @@ def gates_to_param_circuit(gates, n, parametrize='U3', **circuit_opts):
     -------
     Circuit
     """
+    from .circuit import Circuit
+
     if isinstance(parametrize, str):
         parametrize = (parametrize,)
 
@@ -134,13 +135,22 @@ def gates_to_param_circuit(gates, n, parametrize='U3', **circuit_opts):
     return circ
 
 
-def circ_ansatz_1D_zigzag(
-    n,
-    depth,
-    gate2='cz',
-    seed=None,
-    **circuit_opts
-):
+def gates_1D_zigzag(n, depth, gate2="cz", seed=None):
+    ent_gates = []
+    forward_layer = [(i, i + 1) for i in range(n - 1)]
+    backward_layer = [(i + 1, i) for i in range(n - 2, -1, -1)]
+
+    for d in range(depth):
+        if d % 2 == 0:
+            ent_gates.extend(forward_layer)
+        else:
+            ent_gates.extend(backward_layer)
+
+    # inject U3 gates!
+    return inject_u3s(ent_gates, gate2=gate2, seed=seed)
+
+
+def circ_ansatz_1D_zigzag(n, depth, gate2="cz", seed=None, **circuit_opts):
     r"""A 1D circuit ansatz with forward and backward layers of entangling
     gates interleaved with U3 single qubit unitaries::
 
@@ -181,29 +191,31 @@ def circ_ansatz_1D_zigzag(
     --------
     circ_ansatz_1D_rand, circ_ansatz_1D_brickwork
     """
-    ent_gates = []
-    forward_layer = [(i, i + 1) for i in range(n - 1)]
-    backward_layer = [(i + 1, i) for i in range(n - 2, -1, -1)]
-
-    for d in range(depth):
-        if d % 2 == 0:
-            ent_gates.extend(forward_layer)
-        else:
-            ent_gates.extend(backward_layer)
-
-    # inject U3 gates!
-    gates = inject_u3s(ent_gates, gate2=gate2, seed=seed)
+    gates = gates_1D_zigzag(n, depth, gate2=gate2, seed=seed)
     circ = gates_to_param_circuit(gates, n, **circuit_opts)
 
     return circ
 
 
+def gates_1D_brickwork(n, depth, cyclic=False, gate2="cz", seed=None):
+    ent_gates = []
+    for d in range(depth):
+        # the even pairs layer
+        ent_gates.extend((i, i + 1) for i in range(0, n - 1, 2))
+        if cyclic and (n % 2 == 1):
+            ent_gates.append((n - 1, 0))
+
+        # the odd pairs layer
+        ent_gates.extend((i, i + 1) for i in range(1, n - 1, 2))
+        if cyclic and (n % 2 == 0):
+            ent_gates.append((n - 1, 0))
+
+    # inject U3 gates!
+    return inject_u3s(ent_gates, gate2=gate2, seed=seed)
+
+
 def circ_ansatz_1D_brickwork(
-    n, depth,
-    cyclic=False,
-    gate2='cz',
-    seed=None,
-    **circuit_opts
+    n, depth, cyclic=False, gate2="cz", seed=None, **circuit_opts
 ):
     r"""A 1D circuit ansatz with odd and even layers of entangling
     gates interleaved with U3 single qubit unitaries::
@@ -248,24 +260,30 @@ def circ_ansatz_1D_brickwork(
     --------
     circ_ansatz_1D_zigzag, circ_ansatz_1D_rand
     """
-    ent_gates = []
-    for d in range(depth):
-
-        # the even pairs layer
-        ent_gates.extend((i, i + 1) for i in range(0, n - 1, 2))
-        if cyclic and (n % 2 == 1):
-            ent_gates.append((n - 1, 0))
-
-        # the odd pairs layer
-        ent_gates.extend((i, i + 1) for i in range(1, n - 1, 2))
-        if cyclic and (n % 2 == 0):
-            ent_gates.append((n - 1, 0))
-
-    # inject U3 gates!
-    gates = inject_u3s(ent_gates, gate2=gate2, seed=seed)
+    gates = gates_1D_brickwork(n, depth, cyclic=cyclic, gate2=gate2, seed=seed)
     circ = gates_to_param_circuit(gates, n, **circuit_opts)
 
     return circ
+
+
+def gates_1D_rand(
+    n, depth, seed=None, cyclic=False, gate2="cz", avoid_doubling=True
+):
+    if seed is not None:
+        random.seed(seed)
+
+    # the set number of entangling pairs to distribute randomly
+    ent_gates = [(i, i + 1) for i in range(n - 1) for _ in range(depth)]
+    if cyclic:
+        ent_gates.extend((n - 1, 0) for _ in range(depth))
+
+    # randomly permute the order
+    random.shuffle(ent_gates)
+
+    # inject U3 gates!
+    return inject_u3s(
+        ent_gates, avoid_doubling=avoid_doubling, gate2=gate2, seed=seed
+    )
 
 
 def circ_ansatz_1D_rand(
@@ -273,9 +291,9 @@ def circ_ansatz_1D_rand(
     depth,
     seed=None,
     cyclic=False,
-    gate2='cz',
+    gate2="cz",
     avoid_doubling=True,
-    **circuit_opts
+    **circuit_opts,
 ):
     """A 1D circuit ansatz with randomly place entangling gates interleaved
     with U3 single qubit unitaries.
@@ -306,23 +324,86 @@ def circ_ansatz_1D_rand(
     --------
     circ_ansatz_1D_zigzag, circ_ansatz_1D_brickwork
     """
-    if seed is not None:
-        random.seed(seed)
-
-    # the set number of entangling pairs to distribute randomly
-    ent_gates = [(i, i + 1) for i in range(n - 1) for _ in range(depth)]
-    if cyclic:
-        ent_gates.extend((n - 1, 0) for _ in range(depth))
-
-    # randomly permute the order
-    random.shuffle(ent_gates)
-
-    # inject U3 gates!
-    gates = inject_u3s(ent_gates, avoid_doubling=avoid_doubling,
-                       gate2=gate2, seed=seed)
+    gates = gates_1D_rand(
+        n,
+        depth,
+        seed=seed,
+        cyclic=cyclic,
+        gate2=gate2,
+        avoid_doubling=avoid_doubling,
+    )
     circ = gates_to_param_circuit(gates, n, **circuit_opts)
 
     return circ
+
+
+def gates_a2a_rand(n, depth, seed=None, gate2="cz"):
+    if not isinstance(seed, random.Random):
+        rng = random.Random(seed)
+
+    qubits = list(range(n))
+
+    ent_gates = []
+    for _ in range(depth):
+        rng.shuffle(qubits)
+        for i, j in zip(qubits[::2], qubits[1::2]):
+            ent_gates.append((i, j))
+
+    return inject_u3s(ent_gates, gate2=gate2, seed=seed)
+
+
+def circ_a2a_rand(
+    n,
+    depth,
+    seed=None,
+    gate2="cz",
+    **circuit_opts,
+):
+    """Generate a random all-to-all quantum circuit.
+
+    Parameters
+    ----------
+    n : int
+        The number of qubits.
+    depth : int
+        The circuit depth. Each layer consists of `n // 2` entangling gates
+        applied between a random permutation of qubit pairs.
+    seed : int, optional
+        Random seed.
+    gate2 : {'cx', 'cy', 'cz', 'iswap', ..., str}, optional
+        The gate to use for the entanling pairs.
+
+    Returns
+    -------
+    Circuit
+    """
+    gates = gates_a2a_rand(n, depth, seed=seed, gate2=gate2)
+    circ = gates_to_param_circuit(gates, n, **circuit_opts)
+    return circ
+
+
+def gates_qaoa(
+    terms,
+    depth,
+    gammas,
+    betas,
+):
+    n = max(itertools.chain.from_iterable(terms)) + 1
+
+    gates = []
+
+    # layer of hadamards to get into plus state
+    for i in range(n):
+        gates.append((0, "h", i))
+
+    for d in range(depth):
+        for (i, j), wij in terms.items():
+            gates.append((d, "rzz", wij * gammas[d], i, j))
+
+        for i in range(n):
+            gates.append((d, "rx", -betas[d] * 2, i))
+
+    return gates
 
 
 def circ_qaoa(
@@ -371,23 +452,14 @@ def circ_qaoa(
         overridden) since the RZZ gate, even though it has a rank-2
         decomposition, is also diagonal.
     """
-    circuit_opts.setdefault('gate_opts', {})
-    circuit_opts['gate_opts'].setdefault('contract', False)
+    from .circuit import Circuit
+
+    circuit_opts.setdefault("gate_opts", {})
+    circuit_opts["gate_opts"].setdefault("contract", False)
 
     n = max(itertools.chain.from_iterable(terms)) + 1
 
-    gates = []
-
-    # layer of hadamards to get into plus state
-    for i in range(n):
-        gates.append((0, 'h', i))
-
-    for d in range(depth):
-        for (i, j), wij in terms.items():
-            gates.append((d, 'rzz', wij * gammas[d], i, j))
-
-        for i in range(n):
-            gates.append((d, 'rx', -betas[d] * 2, i))
+    gates = gates_qaoa(terms, depth, gammas, betas)
 
     circ = Circuit(n, **circuit_opts)
     circ.apply_gates(gates)

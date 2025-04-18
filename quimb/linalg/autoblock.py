@@ -1,7 +1,10 @@
-import numpy as np
-import numba
+"""Numba accelerated functions for finding charge sectors and subselecting
+submatrices.
+"""
 
-from ..core import njit, pnjit, qarray
+import numpy as np
+
+from ..core import njit, qarray
 
 
 @njit
@@ -9,22 +12,7 @@ def get_nz(A):  # pragma: no cover
     return np.nonzero(A)
 
 
-@njit(['void(int32, int32, List(Set(int32)))',
-       'void(int64, int64, List(Set(int64)))'])
-def _add_to_groups(i, j, groups):  # pragma: no cover
-    for group in groups:
-        if i in group:
-            group.add(j)
-            return
-        if j in group:
-            group.add(i)
-            return
-    # pair is not in a sector yet - create new one
-    groups.append({i, j})
-
-
-@njit(['List(List(int32))(int32[:], int32[:], int_)',
-       'List(List(int64))(int64[:], int64[:], int_)'])
+@njit
 def compute_blocks(ix, jx, d):  # pragma: no cover
     """Find the charge sectors (blocks in matrix terms) given element
     coordinates ``ix`` and ``jx`` and total size ``d``.
@@ -55,21 +43,47 @@ def compute_blocks(ix, jx, d):  # pragma: no cover
     >>> sectors
     [[0], [1, 2, 4, 8], [3, 5, 6, 9, 10, 12], [7, 11, 13, 14], [15]]
     """
-    groups = [{ix[0], jx[0]}]
+    groups = []
 
-    # go through actual nz
+    # go through actual nz -> these define edges of a graph and we are
+    # looking for all connected components (disconnected subgraphs)
     for i, j in zip(ix, jx):
-        _add_to_groups(i, j, groups)
+        merge = []
+        for g, group in enumerate(groups):
+            if i in group:
+                group.add(j)
+                merge.append(g)
+            elif j in group:
+                group.add(i)
+                merge.append(g)
+
+        if len(merge) == 0:
+            # new group
+            groups.append({i, j})
+
+        elif len(merge) > 1:
+            # merge groups
+            group0 = groups[merge[0]]
+            for g in merge[-1:0:-1]:
+                # XXX: just popping here causes numba big problems?
+                # so we clear and filter empty groups later
+                other_group = groups[g]
+                group0.update(other_group)
+                other_group.clear()
 
     # make sure kernel added as subspace
     for i in range(d):
-        _add_to_groups(i, i, groups)
+        for group in groups:
+            if i in group:
+                break
+        else:  # no break
+            groups.append({i})
 
     # sort indices in each group and groups by first element
-    return sorted([sorted(g) for g in groups])
+    return sorted([sorted(g) for g in groups if g])
 
 
-@pnjit
+@njit
 def subselect(A, p):  # pragma: no cover
     """Select only the intersection of rows and columns of ``A`` matching the
     basis indices ``p``. Faster than double numpy slicing.
@@ -103,14 +117,14 @@ def subselect(A, p):  # pragma: no cover
     dp = len(p)
     out = np.empty((dp, dp), dtype=A.dtype)
 
-    for i in numba.prange(dp):
-        for j in numba.prange(dp):
+    for i in range(dp):
+        for j in range(dp):
             out[i, j] = A[p[i], p[j]]
 
     return out
 
 
-@pnjit
+@njit
 def subselect_set(A, B, p):  # pragma: no cover
     """Set only the intersection of rows and colums of ``A`` matching the
     basis indices ``p`` to ``B``.
@@ -138,8 +152,8 @@ def subselect_set(A, B, p):  # pragma: no cover
     """
     dp = len(p)
 
-    for i in numba.prange(dp):
-        for j in numba.prange(dp):
+    for i in range(dp):
+        for j in range(dp):
             A[p[i], p[j]] = B[i, j]
 
 
@@ -158,7 +172,7 @@ def _eigh_autoblocked(A, sort=True):  # pragma: no cover
     gs = [np.array(g) for g in gs]
 
     # diagonalize each charge sector seperately
-    for i, g in enumerate(gs):
+    for g in gs:
         ng = len(g)
 
         # check if trivial
@@ -195,7 +209,7 @@ def _eigvalsh_autoblocked(A, sort=True):  # pragma: no cover
     gs = compute_blocks(ix, jx, d)
     gs = [np.array(g) for g in gs]
 
-    for i, g in enumerate(gs):
+    for _, g in enumerate(gs):
         if len(g) == 1:
             el[g[0]] = A[g[0], g[0]]
             continue
@@ -203,7 +217,7 @@ def _eigvalsh_autoblocked(A, sort=True):  # pragma: no cover
         el[g] = np.linalg.eigvalsh(subselect(A, g))
 
     if sort:
-        el[:] = np.sort(el)
+        return np.sort(el)
 
     return el
 

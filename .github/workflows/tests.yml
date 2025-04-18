@@ -1,0 +1,98 @@
+name: Tests
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+defaults:
+  run:
+    shell: bash -l {0}
+
+jobs:
+  run-tests:
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.flaky }}
+    strategy:
+      matrix:
+        testset: [matrix, tensor]
+        conda-env: [base]
+        os: [ubuntu-latest]
+        python-version: ['3.9', '3.12']
+        flaky: [false]
+
+        include:
+        - os: macos-latest
+          testset: matrix
+          conda-env: base
+          python-version: '3.11'
+          flaky: true
+
+        - os: macos-latest
+          testset: tensor
+          conda-env: base
+          python-version: '3.11'
+          flaky: false
+
+        - os: windows-latest
+          testset: matrix
+          conda-env: openblas
+          python-version: '3.11'
+          flaky: false
+          env:
+            KMP_DUPLICATE_LIB_OK: "True"
+
+        - os: windows-latest
+          testset: tensor
+          conda-env: openblas
+          python-version: '3.11'
+          flaky: false
+          env:
+            KMP_DUPLICATE_LIB_OK: "True"
+
+        - conda-env: torch
+          testset: tensor
+          os: ubuntu-latest
+          python-version: '3.11'
+          flaky: false
+
+        - conda-env: jax
+          testset: tensor
+          os: ubuntu-latest
+          python-version: '3.11'
+          flaky: false
+
+        - conda-env: tensorflow
+          testset: tensor
+          os: ubuntu-latest
+          python-version: '3.11'
+          flaky: false
+
+        - conda-env: slepc
+          testset: matrix
+          os: ubuntu-latest
+          python-version: '3.11'
+          flaky: false
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Miniconda
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        python-version: ${{ matrix.python-version }}
+        miniforge-version: latest
+        environment-file: ci/requirements/py-${{ matrix.conda-env }}.yml
+
+    - name: Matrix submodule tests with pytest
+      if: ${{ matrix.testset == 'matrix' }}
+      run: pytest tests/ --cov=quimb --cov-report=xml --ignore=tests/test_tensor
+
+    - name: Tensor tests with pytest
+      if: ${{ matrix.testset == 'tensor' }}
+      run: pytest tests/test_tensor --cov=quimb --cov-report=xml
+
+    - name: Report to codecov
+      uses: codecov/codecov-action@v4
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
